@@ -16,8 +16,6 @@ The portal currently includes:
   - Simple Linear Regression
   - Multiple Linear Regression
   - Polynomial Regression
-  - Ridge Regression
-  - Lasso Regression
 
 - Classification
   - Logistic Regression
