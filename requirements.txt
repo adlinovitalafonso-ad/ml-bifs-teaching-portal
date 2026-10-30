@@ -1,0 +1,10 @@
+streamlit
+numpy
+pandas
+matplotlib
+scikit-learn
+scipy
+xgboost
+vaderSentiment
+transformers
+torch
