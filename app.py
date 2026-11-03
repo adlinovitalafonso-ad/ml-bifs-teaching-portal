@@ -690,6 +690,19 @@ def report_download(title, sections, filename):
     return text
 
 
+def dataset_download(df, filename, label="Download current dataset CSV", key=None):
+    """Consistent CSV download control for teaching datasets."""
+    if df is None:
+        return
+    st.download_button(
+        label,
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=filename,
+        mime="text/csv",
+        key=key
+    )
+
+
 def classification_interpretation(model_name, metrics, threshold, cm=None, top_features=None, model_notes=None):
     acc = metrics["Accuracy"]
     p = metrics["Precision"]
@@ -1248,6 +1261,12 @@ if section == "Home":
 elif section == "Regression":
     st.header("Regression Laboratory")
     df, custom = upload_or_builtin("reg", regression_data())
+    dataset_download(
+        df,
+        "regression_teaching_dataset.csv",
+        "Download regression dataset CSV",
+        key="download_reg_dataset"
+    )
     df = choose_row_subset(df, "reg")
     nums = numeric_cols(df)
     if len(nums) < 2:
@@ -1427,6 +1446,12 @@ elif section == "Regression":
 elif section == "Classification":
     st.header("Classification Laboratory")
     df, custom = upload_or_builtin("class", classification_data())
+    dataset_download(
+        df,
+        "classification_teaching_dataset.csv",
+        "Download classification dataset CSV",
+        key="download_class_dataset"
+    )
     if custom:
         target_col = st.selectbox("Choose binary target column", df.columns)
         df = choose_row_subset(df, "class", supervised_target=target_col)
@@ -1633,6 +1658,12 @@ elif section == "Classification":
 elif section == "K-Means Clustering":
     st.header("K-Means Customer Segmentation")
     df, custom = upload_or_builtin("kmeans", clustering_data())
+    dataset_download(
+        df,
+        "kmeans_teaching_dataset.csv",
+        "Download K-Means dataset CSV",
+        key="download_kmeans_dataset"
+    )
     df = choose_row_subset(df, "kmeans")
     encoding_panel(df, None, "km_enc")
     nums = [c for c in numeric_cols(df) if c not in id_like_columns(df)]
@@ -1675,6 +1706,12 @@ elif section == "K-Means Clustering":
 elif section == "Hierarchical Clustering":
     st.header("Hierarchical Clustering")
     df, custom = upload_or_builtin("hier", clustering_data(n=150))
+    dataset_download(
+        df,
+        "hierarchical_teaching_dataset.csv",
+        "Download hierarchical clustering dataset CSV",
+        key="download_hier_dataset"
+    )
     df = choose_row_subset(df, "hier")
     encoding_panel(df, None, "hier_enc")
     nums = [c for c in numeric_cols(df) if c not in id_like_columns(df)]
@@ -1709,6 +1746,12 @@ elif section == "Hierarchical Clustering":
 elif section == "PCA":
     st.header("Principal Component Analysis")
     df, custom = upload_or_builtin("pca", pca_customer_data())
+    dataset_download(
+        df,
+        "pca_teaching_dataset.csv",
+        "Download PCA dataset CSV",
+        key="download_pca_dataset"
+    )
     df = choose_row_subset(df, "pca")
     nums = [c for c in numeric_cols(df) if c not in id_like_columns(df)]
     low_num = low_cardinality_numeric(df)
@@ -1899,6 +1942,14 @@ elif section == "Semi-Supervised Learning":
             difficulty=difficulty
         )
         target_col = "Default"
+
+        dataset_download(
+            df,
+            "semi_supervised_synthetic_default_dataset.csv",
+            "Download semi-supervised synthetic dataset CSV",
+            key="download_ssl_builtin_dataset"
+        )
+
         df = choose_row_subset(
             df,
             "ssl_subset_builtin",
@@ -1920,6 +1971,13 @@ elif section == "Semi-Supervised Learning":
 
         st.success(
             f"Loaded {df.shape[0]} rows × {df.shape[1]} columns."
+        )
+
+        dataset_download(
+            df,
+            "semi_supervised_uploaded_dataset.csv",
+            "Download uploaded semi-supervised dataset CSV",
+            key="download_ssl_uploaded_dataset"
         )
 
         target_col = st.selectbox(
@@ -2884,24 +2942,51 @@ elif section == "Reinforcement Learning":
     rewards = np.zeros(n_arms, dtype=float)
     cumulative_reward = []
     chosen_actions = []
+    interaction_rows = []
 
     for t in range(n_rounds):
-        if rng.random() < epsilon or counts.sum() == 0:
+        explore_draw = float(rng.random())
+
+        if explore_draw < epsilon or counts.sum() == 0:
+            decision_mode = "Explore"
             action = int(rng.integers(0, n_arms))
         else:
-            estimates = np.divide(
+            decision_mode = "Exploit"
+            estimates_before = np.divide(
                 rewards,
                 counts,
                 out=np.zeros_like(rewards),
                 where=counts > 0
             )
-            action = int(np.argmax(estimates))
+            action = int(np.argmax(estimates_before))
 
-        reward = 1 if rng.random() < true_probs[action] else 0
+        outcome_draw = float(rng.random())
+        reward = 1 if outcome_draw < true_probs[action] else 0
+
         counts[action] += 1
         rewards[action] += reward
         chosen_actions.append(action)
         cumulative_reward.append(rewards.sum())
+
+        estimates_after = np.divide(
+            rewards,
+            counts,
+            out=np.zeros_like(rewards),
+            where=counts > 0
+        )
+
+        interaction_rows.append({
+            "Interaction": t + 1,
+            "Decision mode": decision_mode,
+            "Epsilon": epsilon,
+            "Action chosen": f"Offer {action + 1}",
+            "True success probability of chosen action": float(true_probs[action]),
+            "Simulated outcome draw": outcome_draw,
+            "Reward": int(reward),
+            "Estimated success rate after update": float(estimates_after[action]),
+            "Times chosen so far": int(counts[action]),
+            "Cumulative reward": float(rewards.sum())
+        })
 
     estimates = np.divide(
         rewards, counts,
@@ -2917,6 +3002,17 @@ elif section == "Reinforcement Learning":
         "True success rate (teaching only)": true_probs
     })
     st.dataframe(result, use_container_width=True)
+
+    interaction_df = pd.DataFrame(interaction_rows)
+    with st.expander("View interaction-level learning data"):
+        st.dataframe(interaction_df, use_container_width=True)
+
+    dataset_download(
+        interaction_df,
+        "reinforcement_learning_bandit_interactions.csv",
+        "Download RL interaction dataset CSV",
+        key="download_rl_interactions"
+    )
 
     fig, ax = plt.subplots()
     ax.plot(range(1, n_rounds + 1), cumulative_reward)
@@ -2987,6 +3083,18 @@ elif section == "NLP":
         work_nlp = nlp_df[[text_col]].dropna().head(int(max_rows))
         texts = work_nlp[text_col].astype(str).tolist()
         row_ids = work_nlp.index.tolist()
+
+    nlp_input_df = pd.DataFrame({
+        "Row": row_ids,
+        "Text": texts
+    })
+
+    dataset_download(
+        nlp_input_df,
+        "nlp_input_dataset.csv",
+        "Download NLP input dataset CSV",
+        key="download_nlp_input"
+    )
 
     if nlp_mode == "VADER Sentiment":
         if not VADER_AVAILABLE:
