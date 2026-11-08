@@ -1218,6 +1218,96 @@ def vader_sentiment(text_value):
     return label, compound, scores
 
 
+def normalize_sentiment_label(value):
+    """Normalize common sentiment labels for comparison."""
+    if pd.isna(value):
+        return None
+    s = str(value).strip().lower()
+    mapping = {
+        "positive": "positive", "pos": "positive", "1": "positive",
+        "negative": "negative", "neg": "negative", "-1": "negative",
+        "neutral": "neutral", "neu": "neutral", "0": "neutral"
+    }
+    return mapping.get(s, s)
+
+
+def ensure_nltk_resources():
+    """Load NLTK and quietly obtain the small resources used by the teaching explorer."""
+    try:
+        import nltk
+        resources = [
+            ("tokenizers/punkt", "punkt"),
+            ("tokenizers/punkt_tab", "punkt_tab"),
+            ("corpora/stopwords", "stopwords"),
+            ("corpora/wordnet", "wordnet"),
+            ("corpora/omw-1.4", "omw-1.4"),
+            ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
+            ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
+            ("chunkers/maxent_ne_chunker", "maxent_ne_chunker"),
+            ("chunkers/maxent_ne_chunker_tab", "maxent_ne_chunker_tab"),
+            ("corpora/words", "words"),
+        ]
+        for path_name, download_name in resources:
+            try:
+                nltk.data.find(path_name)
+            except LookupError:
+                try:
+                    nltk.download(download_name, quiet=True)
+                except Exception:
+                    pass
+        return nltk, None
+    except Exception as e:
+        return None, e
+
+
+def preprocessing_steps(text_value):
+    """Return teaching-oriented NLP preprocessing outputs for one text."""
+    nltk, err = ensure_nltk_resources()
+    if nltk is None:
+        return None, f"NLTK is not available: {err}"
+
+    try:
+        from nltk.tokenize import sent_tokenize, word_tokenize
+        from nltk.corpus import stopwords
+        from nltk.stem import PorterStemmer, WordNetLemmatizer
+        from nltk import pos_tag, ne_chunk
+
+        sentences = sent_tokenize(text_value)
+        tokens = word_tokenize(text_value)
+        alpha_tokens = [t for t in tokens if any(ch.isalnum() for ch in t)]
+        lower_tokens = [t.lower() for t in alpha_tokens]
+
+        stop_set = set(stopwords.words("english"))
+        no_stop = [t for t in lower_tokens if t not in stop_set]
+
+        stemmer = PorterStemmer()
+        stems = [stemmer.stem(t) for t in no_stop]
+
+        lemmatizer = WordNetLemmatizer()
+        lemmas = [lemmatizer.lemmatize(t) for t in no_stop]
+
+        tagged = pos_tag(alpha_tokens)
+        tree = ne_chunk(tagged)
+        entities = []
+        for node in tree:
+            if hasattr(node, "label"):
+                entity_text = " ".join(word for word, _ in node.leaves())
+                entities.append((entity_text, node.label()))
+
+        return {
+            "sentences": sentences,
+            "tokens": alpha_tokens,
+            "lower": lower_tokens,
+            "no_stop": no_stop,
+            "stems": stems,
+            "lemmas": lemmas,
+            "pos": tagged,
+            "entities": entities,
+        }, None
+    except Exception as e:
+        return None, str(e)
+
+
 def footer():
     st.markdown("---")
     st.caption(
@@ -3067,7 +3157,12 @@ elif section == "NLP":
 
     nlp_mode = st.selectbox(
         "Choose NLP activity",
-        ["VADER Sentiment", "FinBERT Financial Sentiment", "TF-IDF Keywords"]
+        [
+            "Preprocessing Explorer",
+            "VADER Sentiment",
+            "FinBERT Financial Sentiment",
+            "TF-IDF Keywords"
+        ]
     )
     log_event("NLP", "model_tried", {"method": nlp_mode})
 
@@ -3079,6 +3174,8 @@ elif section == "NLP":
 
     texts = []
     row_ids = []
+    actual_labels = []
+    actual_label_col = None
 
     if source == "Type / paste text":
         user_text = st.text_area(
@@ -3089,27 +3186,81 @@ elif section == "NLP":
         if user_text.strip():
             texts = [user_text.strip()]
             row_ids = [1]
+            actual_labels = [None]
     else:
         uploaded = st.file_uploader("Upload CSV containing text", type=["csv"], key="nlp_csv")
         if uploaded is None:
             st.info("Upload a CSV to continue.")
             st.stop()
-        nlp_df, detected_encoding = read_uploaded_csv(uploaded)
+
+        header_mode = st.radio(
+            "CSV format",
+            ["First row contains column names", "No header row"],
+            horizontal=True,
+            key="nlp_header_mode"
+        )
+        try:
+            if header_mode == "No header row":
+                encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
+                nlp_df = None
+                detected_encoding = None
+                for enc in encodings:
+                    try:
+                        uploaded.seek(0)
+                        nlp_df = pd.read_csv(uploaded, encoding=enc, header=None)
+                        detected_encoding = enc
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if nlp_df is None:
+                    raise ValueError("Unable to decode the CSV file.")
+                nlp_df.columns = [f"Column {i+1}" for i in range(nlp_df.shape[1])]
+            else:
+                nlp_df, detected_encoding = read_uploaded_csv(uploaded)
+        except Exception as e:
+            st.error(f"Could not read file: {e}")
+            st.stop()
+
+        st.success(
+            f"Loaded {nlp_df.shape[0]} rows × {nlp_df.shape[1]} columns "
+            f"(encoding: {detected_encoding})."
+        )
+        st.dataframe(nlp_df.head(), use_container_width=True)
+
         text_col = st.selectbox("Choose text column", nlp_df.columns.tolist())
+        label_options = ["None — no actual sentiment label"] + [
+            c for c in nlp_df.columns if c != text_col
+        ]
+        selected_label = st.selectbox(
+            "Actual sentiment / label column (optional)",
+            label_options,
+            help="Choose the dataset's known sentiment label if available. This lets the app compare actual and predicted sentiment."
+        )
+        if selected_label != "None — no actual sentiment label":
+            actual_label_col = selected_label
+
         max_rows = st.number_input(
             "Number of text rows to analyse",
             min_value=1,
             max_value=int(len(nlp_df)),
             value=int(min(100, len(nlp_df)))
         )
-        work_nlp = nlp_df[[text_col]].dropna().head(int(max_rows))
+
+        keep_cols = [text_col] + ([actual_label_col] if actual_label_col else [])
+        work_nlp = nlp_df[keep_cols].dropna(subset=[text_col]).head(int(max_rows))
         texts = work_nlp[text_col].astype(str).tolist()
         row_ids = work_nlp.index.tolist()
+        if actual_label_col:
+            actual_labels = work_nlp[actual_label_col].tolist()
+        else:
+            actual_labels = [None] * len(work_nlp)
 
     nlp_input_df = pd.DataFrame({
         "Row": row_ids,
         "Text": texts
     })
+    if actual_label_col and len(actual_labels) == len(nlp_input_df):
+        nlp_input_df["Actual Sentiment"] = actual_labels
 
     dataset_download(
         nlp_input_df,
@@ -3118,27 +3269,180 @@ elif section == "NLP":
         key="download_nlp_input"
     )
 
-    if nlp_mode == "VADER Sentiment":
+    if nlp_mode == "Preprocessing Explorer":
+        if not texts:
+            st.stop()
+
+        st.subheader("Step-by-step NLP preprocessing")
+        st.caption(
+            "This explorer shows common NLP preprocessing/tasks. Stemming and lemmatization are shown as alternatives; "
+            "POS tagging and named-entity recognition are additional NLP analyses rather than mandatory steps for every model."
+        )
+
+        if len(texts) > 1:
+            chosen_idx = st.selectbox(
+                "Choose a row to explore",
+                list(range(len(texts))),
+                format_func=lambda i: f"Row {row_ids[i]} — {texts[i][:90]}"
+            )
+        else:
+            chosen_idx = 0
+
+        selected_text = texts[chosen_idx]
+        st.markdown("**Original text**")
+        st.info(selected_text)
+
+        steps, prep_error = preprocessing_steps(selected_text)
+        if steps is None:
+            st.error(
+                "The full preprocessing explorer requires NLTK and its language resources. "
+                "Add `nltk` to requirements.txt for deployment."
+            )
+            st.caption(prep_error or "")
+        else:
+            r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+            with r1c1:
+                st.markdown("**1. Segmentation**")
+                st.write(steps["sentences"])
+                st.caption("Splits longer text into sentences.")
+            with r1c2:
+                st.markdown("**2. Tokenization**")
+                st.write(steps["tokens"])
+                st.caption("Splits text into word-like units.")
+            with r1c3:
+                st.markdown("**3. Lowercase**")
+                st.write(steps["lower"])
+                st.caption("Normalizes capitalization.")
+            with r1c4:
+                st.markdown("**4. Remove stop words**")
+                st.write(steps["no_stop"])
+                st.caption("Removes frequent function words for this demonstration.")
+
+            r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+            with r2c1:
+                st.markdown("**5A. Stemming**")
+                st.write(steps["stems"])
+                st.caption("Heuristically chops endings; output need not be a valid word.")
+            with r2c2:
+                st.markdown("**5B. Lemmatization**")
+                st.write(steps["lemmas"])
+                st.caption("Returns dictionary-style base forms where possible.")
+            with r2c3:
+                st.markdown("**6. Part-of-Speech tagging**")
+                pos_df = pd.DataFrame(steps["pos"], columns=["Token", "POS tag"])
+                st.dataframe(pos_df, hide_index=True, use_container_width=True)
+            with r2c4:
+                st.markdown("**7. Named Entity Recognition**")
+                if steps["entities"]:
+                    ner_df = pd.DataFrame(steps["entities"], columns=["Entity", "Type"])
+                    st.dataframe(ner_df, hide_index=True, use_container_width=True)
+                else:
+                    st.write("No named entities detected in this text.")
+
+            st.warning(
+                "Preprocessing depends on the method. For VADER and transformer models such as FinBERT, "
+                "do not automatically remove negations, punctuation or other context before prediction. "
+                "The explorer is for understanding the operations, not a rule that every model must use every step."
+            )
+
+    elif nlp_mode == "VADER Sentiment":
         if not VADER_AVAILABLE:
             st.error("Install VADER with: python -m pip install vaderSentiment")
         else:
             rows = []
-            for rid, txt in zip(row_ids, texts):
+            for rid, txt, actual in zip(row_ids, texts, actual_labels):
                 label, compound, scores = vader_sentiment(txt)
-                rows.append({
+                row = {
                     "Row": rid,
                     "Text": txt,
-                    "Sentiment": label,
+                    "VADER Sentiment": label,
                     "Compound": compound,
                     "Positive": scores["pos"],
                     "Neutral": scores["neu"],
                     "Negative": scores["neg"]
-                })
+                }
+                if actual_label_col:
+                    actual_norm = normalize_sentiment_label(actual)
+                    row["Actual Sentiment"] = actual_norm
+                    row["Correct?"] = actual_norm == label
+                rows.append(row)
+
             out_df = pd.DataFrame(rows)
-            st.dataframe(out_df, use_container_width=True)
+            display_cols = ["Row", "Text"]
+            if actual_label_col:
+                display_cols += ["Actual Sentiment"]
+            display_cols += [
+                "VADER Sentiment", "Positive", "Neutral", "Negative", "Compound"
+            ]
+            if actual_label_col:
+                display_cols += ["Correct?"]
+            st.dataframe(out_df[display_cols], use_container_width=True)
+
+            if actual_label_col and len(out_df):
+                valid_eval = out_df[
+                    out_df["Actual Sentiment"].isin(["positive", "negative", "neutral"])
+                ].copy()
+                if len(valid_eval):
+                    accuracy = (valid_eval["Actual Sentiment"] == valid_eval["VADER Sentiment"]).mean()
+                    st.metric("VADER accuracy against actual labels", f"{accuracy:.1%}")
+                    confusion = pd.crosstab(
+                        valid_eval["Actual Sentiment"],
+                        valid_eval["VADER Sentiment"],
+                        rownames=["Actual"],
+                        colnames=["Predicted"]
+                    )
+                    st.markdown("**Actual vs predicted sentiment**")
+                    st.dataframe(confusion, use_container_width=True)
+
+            st.subheader("How VADER produces the scores")
+            st.write(
+                "VADER uses a sentiment lexicon plus rules for features such as negation, intensifiers, "
+                "capitalization, punctuation and contrast words. The Positive, Neutral and Negative values "
+                "describe the relative sentiment composition of the text and normally sum to approximately 1."
+            )
+
+            if len(out_df):
+                inspect_i = st.selectbox(
+                    "Inspect one VADER result",
+                    list(range(len(out_df))),
+                    format_func=lambda i: f"Row {out_df.iloc[i]['Row']} — {out_df.iloc[i]['Text'][:90]}",
+                    key="vader_inspect_row"
+                )
+                selected = out_df.iloc[inspect_i]
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Positive proportion", f"{selected['Positive']:.3f}")
+                c2.metric("Neutral proportion", f"{selected['Neutral']:.3f}")
+                c3.metric("Negative proportion", f"{selected['Negative']:.3f}")
+                st.caption(
+                    f"Positive + Neutral + Negative = "
+                    f"{selected['Positive'] + selected['Neutral'] + selected['Negative']:.3f}"
+                )
+
+                compound = float(selected["Compound"])
+                st.metric("Compound score", f"{compound:.4f}")
+                st.latex(r"\text{Compound}=\frac{x}{\sqrt{x^2+15}}")
+                st.caption(
+                    "Here x is the sum of VADER's rule-adjusted sentiment valences. Compound is computed "
+                    "from those adjusted valences; it is NOT calculated as Positive minus Negative."
+                )
+                if abs(compound) < 0.999999:
+                    implied_x = compound * np.sqrt(15.0 / max(1e-12, 1.0 - compound**2))
+                    st.write(
+                        f"For this compound score, the normalization corresponds to an adjusted valence "
+                        f"sum of approximately **{implied_x:.3f}** before normalization."
+                    )
+
+                if compound >= 0.05:
+                    threshold_text = "Compound ≥ 0.05 → Positive"
+                elif compound <= -0.05:
+                    threshold_text = "Compound ≤ -0.05 → Negative"
+                else:
+                    threshold_text = "-0.05 < Compound < 0.05 → Neutral"
+                st.success(threshold_text)
+
             st.download_button(
                 "Download VADER results",
-                out_df.to_csv(index=False).encode(),
+                out_df.to_csv(index=False).encode("utf-8"),
                 "vader_results.csv",
                 "text/csv"
             )
@@ -3155,19 +3459,31 @@ elif section == "NLP":
             with st.spinner("Loading FinBERT..."):
                 finbert = get_finbert_pipeline()
             rows = []
-            for rid, txt in zip(row_ids, texts):
+            for rid, txt, actual in zip(row_ids, texts, actual_labels):
                 res = finbert(txt[:3000])[0]
-                rows.append({
+                row = {
                     "Row": rid,
                     "Text": txt,
-                    "Sentiment": res["label"],
+                    "FinBERT Sentiment": str(res["label"]).lower(),
                     "Confidence": float(res["score"])
-                })
+                }
+                if actual_label_col:
+                    actual_norm = normalize_sentiment_label(actual)
+                    row["Actual Sentiment"] = actual_norm
+                    row["Correct?"] = actual_norm == row["FinBERT Sentiment"]
+                rows.append(row)
             out_df = pd.DataFrame(rows)
             st.dataframe(out_df, use_container_width=True)
+            if actual_label_col and len(out_df):
+                valid_eval = out_df[
+                    out_df["Actual Sentiment"].isin(["positive", "negative", "neutral"])
+                ].copy()
+                if len(valid_eval):
+                    accuracy = (valid_eval["Actual Sentiment"] == valid_eval["FinBERT Sentiment"]).mean()
+                    st.metric("FinBERT accuracy against actual labels", f"{accuracy:.1%}")
             st.download_button(
                 "Download FinBERT results",
-                out_df.to_csv(index=False).encode(),
+                out_df.to_csv(index=False).encode("utf-8"),
                 "finbert_results.csv",
                 "text/csv"
             )
