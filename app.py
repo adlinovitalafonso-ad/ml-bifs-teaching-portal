@@ -556,11 +556,14 @@ def upload_or_builtin(key, built_in_df):
         st.info("Choose a CSV file to continue.")
         st.stop()
     try:
-        df = pd.read_csv(uploaded)
+        df, detected_encoding = read_uploaded_csv(uploaded)
     except Exception as e:
         st.error(f"Could not read file: {e}")
         st.stop()
-    st.success(f"Loaded {df.shape[0]} rows × {df.shape[1]} columns.")
+    st.success(
+        f"Loaded {df.shape[0]} rows × {df.shape[1]} columns "
+        f"(encoding: {detected_encoding})."
+    )
     st.dataframe(df.head(), use_container_width=True)
     return df, True
 
@@ -701,6 +704,25 @@ def dataset_download(df, filename, label="Download current dataset CSV", key=Non
         mime="text/csv",
         key=key
     )
+
+
+def read_uploaded_csv(uploaded_file):
+    """Read uploaded CSV files using common text encodings."""
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
+
+    last_error = None
+    for encoding in encodings:
+        try:
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, encoding=encoding)
+            return df, encoding
+        except UnicodeDecodeError as e:
+            last_error = e
+
+    uploaded_file.seek(0)
+    if last_error:
+        raise last_error
+    raise ValueError("Unable to decode the CSV file.")
 
 
 def classification_interpretation(model_name, metrics, threshold, cm=None, top_features=None, model_notes=None):
@@ -3072,7 +3094,7 @@ elif section == "NLP":
         if uploaded is None:
             st.info("Upload a CSV to continue.")
             st.stop()
-        nlp_df = pd.read_csv(uploaded)
+        nlp_df, detected_encoding = read_uploaded_csv(uploaded)
         text_col = st.selectbox("Choose text column", nlp_df.columns.tolist())
         max_rows = st.number_input(
             "Number of text rows to analyse",
