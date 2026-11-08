@@ -26,7 +26,7 @@ from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.metrics import (
     mean_squared_error, r2_score, accuracy_score, precision_score,
     recall_score, f1_score, roc_auc_score, confusion_matrix,
-    silhouette_score, log_loss
+    silhouette_score, log_loss, classification_report
 )
 from sklearn.decomposition import PCA
 from scipy.cluster.hierarchy import linkage, dendrogram
@@ -3160,8 +3160,9 @@ elif section == "NLP":
         [
             "Preprocessing Explorer",
             "VADER Sentiment",
-            "FinBERT Financial Sentiment",
-            "TF-IDF Keywords"
+            "TF-IDF Keywords",
+            "TF-IDF + Logistic Regression",
+            "FinBERT Financial Sentiment"
         ]
     )
     log_event("NLP", "model_tried", {"method": nlp_mode})
@@ -3239,11 +3240,20 @@ elif section == "NLP":
         if selected_label != "None — no actual sentiment label":
             actual_label_col = selected_label
 
+        default_nlp_rows = (
+            len(nlp_df)
+            if nlp_mode == "TF-IDF + Logistic Regression"
+            else min(100, len(nlp_df))
+        )
         max_rows = st.number_input(
             "Number of text rows to analyse",
             min_value=1,
             max_value=int(len(nlp_df)),
-            value=int(min(100, len(nlp_df)))
+            value=int(default_nlp_rows),
+            help=(
+                "For supervised TF-IDF + Logistic Regression, using more labelled rows usually gives "
+                "the model more examples to learn from. Other NLP activities default to a smaller teaching sample."
+            )
         )
 
         keep_cols = [text_col] + ([actual_label_col] if actual_label_col else [])
@@ -3493,6 +3503,251 @@ elif section == "NLP":
                 "python -m pip install transformers torch"
             )
             st.caption(str(e))
+
+    elif nlp_mode == "TF-IDF + Logistic Regression":
+        st.subheader("Supervised NLP — TF-IDF + Logistic Regression")
+        st.caption(
+            "Unlike VADER or the pretrained FinBERT model, this activity trains a new classifier "
+            "from the text and actual labels in your uploaded dataset."
+        )
+
+        if source != "Upload CSV":
+            st.info(
+                "This supervised activity needs a labelled dataset. Choose **Upload CSV**, then select "
+                "the text column and the actual sentiment / label column."
+            )
+            st.stop()
+
+        if not actual_label_col:
+            st.warning(
+                "Choose an **Actual sentiment / label column** above. Supervised learning needs known labels "
+                "so that the model can learn from examples."
+            )
+            st.stop()
+
+        if not TFIDF_AVAILABLE:
+            st.error("TF-IDF is unavailable. Ensure scikit-learn is installed.")
+            st.stop()
+
+        supervised_df = pd.DataFrame({
+            "Text": texts,
+            "Actual": actual_labels
+        }).dropna()
+
+        supervised_df["Text"] = supervised_df["Text"].astype(str).str.strip()
+        supervised_df["Actual"] = supervised_df["Actual"].apply(normalize_sentiment_label)
+        supervised_df = supervised_df[
+            (supervised_df["Text"] != "") &
+            supervised_df["Actual"].notna()
+        ].copy()
+
+        class_counts = supervised_df["Actual"].value_counts()
+        if len(class_counts) < 2:
+            st.error("The selected label column must contain at least two classes.")
+            st.stop()
+
+        if int(class_counts.min()) < 2:
+            st.error(
+                "Each class needs at least two labelled rows for a stratified train/test split. "
+                "Use more rows or choose a different label column."
+            )
+            st.stop()
+
+        st.markdown(
+            "**Learning workflow:** Text + actual labels → Train/test split → "
+            "TF-IDF fitted on training text → Logistic Regression learns from training labels → "
+            "Test-set prediction and evaluation."
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            test_size = st.slider(
+                "Test-set percentage",
+                min_value=10,
+                max_value=40,
+                value=20,
+                step=5,
+                key="nlp_lr_test_pct"
+            )
+        with c2:
+            max_features = st.select_slider(
+                "Maximum TF-IDF features",
+                options=[500, 1000, 2000, 3000, 5000, 8000, 10000],
+                value=5000,
+                key="nlp_lr_max_features",
+                help="Each learned TF-IDF term becomes a numerical predictor for Logistic Regression."
+            )
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            supervised_df["Text"],
+            supervised_df["Actual"],
+            test_size=test_size / 100,
+            random_state=42,
+            stratify=supervised_df["Actual"]
+        )
+
+        st.write(
+            f"**Rows used:** {len(supervised_df):,}  |  "
+            f"**Training:** {len(X_train):,}  |  **Test:** {len(X_test):,}"
+        )
+
+        with st.expander("See class distribution"):
+            dist = pd.DataFrame({
+                "Full dataset": supervised_df["Actual"].value_counts(),
+                "Training": y_train.value_counts(),
+                "Test": y_test.value_counts()
+            }).fillna(0).astype(int)
+            st.dataframe(dist, use_container_width=True)
+
+        nlp_lr = Pipeline([
+            ("tfidf", TfidfVectorizer(
+                stop_words="english",
+                max_features=int(max_features),
+                lowercase=True
+            )),
+            ("model", LogisticRegression(
+                max_iter=2000,
+                random_state=42
+            ))
+        ])
+
+        nlp_lr.fit(X_train, y_train)
+        y_pred = nlp_lr.predict(X_test)
+        y_prob = nlp_lr.predict_proba(X_test)
+
+        learned_terms = nlp_lr.named_steps["tfidf"].get_feature_names_out()
+        classes = nlp_lr.named_steps["model"].classes_
+
+        st.subheader("What did TF-IDF learn from the training text?")
+        st.metric("TF-IDF predictor features learned", f"{len(learned_terms):,}")
+        st.caption(
+            "Each TF-IDF term is a numerical predictor. The vectorizer was fitted only on the training text, "
+            "so the test set remains unseen during training."
+        )
+        with st.expander("Show example TF-IDF feature names"):
+            st.write(list(learned_terms[:min(100, len(learned_terms))]))
+
+        st.subheader("Test-set performance")
+        report = classification_report(
+            y_test,
+            y_pred,
+            output_dict=True,
+            zero_division=0
+        )
+        accuracy = accuracy_score(y_test, y_pred)
+        macro_precision = precision_score(y_test, y_pred, average="macro", zero_division=0)
+        macro_recall = recall_score(y_test, y_pred, average="macro", zero_division=0)
+        macro_f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Accuracy", f"{accuracy:.1%}")
+        m2.metric("Macro Precision", f"{macro_precision:.3f}")
+        m3.metric("Macro Recall", f"{macro_recall:.3f}")
+        m4.metric("Macro F1", f"{macro_f1:.3f}")
+
+        report_df = pd.DataFrame(report).T
+        st.dataframe(report_df.round(3), use_container_width=True)
+
+        labels = list(classes)
+        cm = confusion_matrix(y_test, y_pred, labels=labels)
+        st.subheader("Confusion matrix")
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.imshow(cm)
+        ax.set_xticks(range(len(labels)))
+        ax.set_yticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=30, ha="right")
+        ax.set_yticklabels(labels)
+        ax.set_xlabel("Predicted sentiment")
+        ax.set_ylabel("Actual sentiment")
+        ax.set_title("TF-IDF + Logistic Regression — Test Set")
+        for i in range(len(labels)):
+            for j in range(len(labels)):
+                ax.text(j, i, int(cm[i, j]), ha="center", va="center")
+        st.pyplot(fig)
+
+        st.subheader("What words did Logistic Regression associate with each class?")
+        coef = nlp_lr.named_steps["model"].coef_
+
+        if len(classes) == coef.shape[0]:
+            for class_idx, class_name in enumerate(classes):
+                top_idx = np.argsort(coef[class_idx])[::-1][:12]
+                top_df = pd.DataFrame({
+                    "Term": learned_terms[top_idx],
+                    "Coefficient": coef[class_idx][top_idx]
+                })
+                with st.expander(f"Strongest terms pushing toward: {class_name}", expanded=False):
+                    st.dataframe(top_df, hide_index=True, use_container_width=True)
+        elif len(classes) == 2 and coef.shape[0] == 1:
+            top_positive = np.argsort(coef[0])[::-1][:12]
+            top_negative = np.argsort(coef[0])[:12]
+            cpos, cneg = st.columns(2)
+            with cpos:
+                st.markdown(f"**Terms pushing toward {classes[1]}**")
+                st.dataframe(
+                    pd.DataFrame({
+                        "Term": learned_terms[top_positive],
+                        "Coefficient": coef[0][top_positive]
+                    }),
+                    hide_index=True,
+                    use_container_width=True
+                )
+            with cneg:
+                st.markdown(f"**Terms pushing toward {classes[0]}**")
+                st.dataframe(
+                    pd.DataFrame({
+                        "Term": learned_terms[top_negative],
+                        "Coefficient": coef[0][top_negative]
+                    }),
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+        st.caption(
+            "A larger positive coefficient means that, all else equal, that TF-IDF term pushes the model "
+            "more strongly toward the displayed class. These associations are learned from this training dataset."
+        )
+
+        st.subheader("Inspect unseen test predictions")
+        test_results = pd.DataFrame({
+            "Text": X_test.values,
+            "Actual": y_test.values,
+            "Predicted": y_pred
+        })
+        test_results["Correct?"] = test_results["Actual"] == test_results["Predicted"]
+        for class_idx, class_name in enumerate(classes):
+            test_results[f"P({class_name})"] = y_prob[:, class_idx]
+
+        st.dataframe(test_results.head(100), use_container_width=True)
+
+        st.subheader("Try a new financial sentence")
+        new_sentence = st.text_area(
+            "Enter an unseen sentence",
+            value="The bank reported strong growth in net profit during the quarter.",
+            key="nlp_lr_new_sentence"
+        )
+        if st.button("Predict sentiment", key="nlp_lr_predict_button"):
+            if new_sentence.strip():
+                pred_class = nlp_lr.predict([new_sentence.strip()])[0]
+                pred_prob = nlp_lr.predict_proba([new_sentence.strip()])[0]
+                st.success(f"Predicted sentiment: **{pred_class}**")
+                prob_df = pd.DataFrame({
+                    "Class": classes,
+                    "Probability": pred_prob
+                }).sort_values("Probability", ascending=False)
+                st.dataframe(prob_df, hide_index=True, use_container_width=True)
+
+        st.download_button(
+            "Download TF-IDF + Logistic Regression test predictions",
+            test_results.to_csv(index=False).encode("utf-8"),
+            "tfidf_logistic_regression_test_predictions.csv",
+            "text/csv"
+        )
+
+        st.info(
+            "Teaching distinction: VADER applies an existing lexicon/rule system; FinBERT applies a pretrained "
+            "financial language model; this TF-IDF + Logistic Regression model learns a new classifier directly "
+            "from the labelled dataset selected above."
+        )
 
     else:
         if not texts:
