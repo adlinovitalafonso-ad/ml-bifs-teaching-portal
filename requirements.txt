@@ -8,3 +8,4 @@ xgboost
 vaderSentiment
 transformers
 torch
+nltk
