@@ -8,6 +8,10 @@ import os
 import sqlite3
 import json
 import uuid
+import re
+import math
+import urllib.request
+import urllib.error
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -460,7 +464,7 @@ access_gate()
 
 
 st.title("Machine Learning for BIFS — Interactive Laboratory")
-st.caption("Interactive demonstrations for regression, classification, clustering, PCA and semi-supervised learning.")
+st.caption("Interactive demonstrations for regression, classification, clustering, PCA, semi-supervised learning, reinforcement learning, NLP and Generative AI.")
 
 # ---------------------------------------------------------------------
 # BUILT-IN DATA
@@ -1318,6 +1322,211 @@ def footer():
 
 
 # ---------------------------------------------------------------------
+# GENERATIVE AI TEACHING HELPERS
+# ---------------------------------------------------------------------
+def genai_tokenize(text_value):
+    """Simple teaching tokenizer. This is illustrative, not a provider tokenizer."""
+    return re.findall(r"[A-Za-z0-9₹$%]+(?:[-'][A-Za-z0-9]+)*|[^\w\s]", str(text_value))
+
+
+GENAI_TEACHING_CORPUS = """
+The bank approved the loan after reviewing the customer's income and repayment history.
+The bank rejected the loan because the customer had repeated repayment delays.
+The customer missed three loan payments and the account became delinquent.
+The credit officer reviewed income debt credit utilization and repayment history.
+High credit utilization can increase predicted default risk.
+A restructuring offer may help a delinquent borrower return to regular repayment.
+The insurance company reviewed the claim documents before approving the settlement.
+The insurer rejected the claim because the policy exclusion applied.
+A language model predicts a likely next token from the preceding context.
+A transformer uses attention to relate tokens to other relevant tokens in the context.
+Retrieval augmented generation retrieves relevant documents before generating an answer.
+RAG can ground a language model in current internal policy documents.
+A hallucination is a plausible sounding but unsupported or incorrect generated statement.
+The model generated a fluent response but invented a policy clause that did not exist.
+""".strip()
+
+
+def build_ngram_counts(corpus_text):
+    tokens = [t.lower() for t in genai_tokenize(corpus_text)]
+    unigram = {}
+    bigram = {}
+    trigram = {}
+    for i, tok in enumerate(tokens):
+        unigram[tok] = unigram.get(tok, 0) + 1
+        if i >= 1:
+            key = (tokens[i-1],)
+            bigram.setdefault(key, {})[tok] = bigram.setdefault(key, {}).get(tok, 0) + 1
+        if i >= 2:
+            key = (tokens[i-2], tokens[i-1])
+            trigram.setdefault(key, {})[tok] = trigram.setdefault(key, {}).get(tok, 0) + 1
+    return unigram, bigram, trigram
+
+
+GENAI_UNIGRAM, GENAI_BIGRAM, GENAI_TRIGRAM = build_ngram_counts(GENAI_TEACHING_CORPUS)
+
+
+def next_token_distribution(context, temperature=1.0, top_n=8):
+    toks = [t.lower() for t in genai_tokenize(context)]
+    counts = None
+    source = "unigram fallback"
+    if len(toks) >= 2 and tuple(toks[-2:]) in GENAI_TRIGRAM:
+        counts = GENAI_TRIGRAM[tuple(toks[-2:])]
+        source = "two-token context"
+    elif len(toks) >= 1 and (toks[-1],) in GENAI_BIGRAM:
+        counts = GENAI_BIGRAM[(toks[-1],)]
+        source = "one-token context"
+    else:
+        counts = GENAI_UNIGRAM
+
+    items = [(k, float(v)) for k, v in counts.items() if k not in {".", ",", ";", ":"}]
+    if not items:
+        return [], source
+    total = sum(v for _, v in items)
+    probs = [(k, v / total) for k, v in items]
+    temp = max(float(temperature), 0.05)
+    adjusted = [(k, p ** (1.0 / temp)) for k, p in probs]
+    z = sum(v for _, v in adjusted)
+    adjusted = [(k, v / z) for k, v in adjusted]
+    adjusted.sort(key=lambda x: x[1], reverse=True)
+    return adjusted[:top_n], source
+
+
+def simulated_generate(prompt, temperature=0.7, max_tokens=20, seed=42):
+    rng = np.random.default_rng(seed)
+    text = prompt.strip()
+    steps = []
+    for step in range(int(max_tokens)):
+        dist, source = next_token_distribution(text, temperature=temperature, top_n=10)
+        if not dist:
+            break
+        words = [w for w, _ in dist]
+        probs = np.array([p for _, p in dist], dtype=float)
+        probs = probs / probs.sum()
+        chosen = rng.choice(words, p=probs)
+        steps.append({
+            "Step": step + 1,
+            "Chosen token": chosen,
+            "Probability": float(dict(dist)[chosen]),
+            "Context rule": source,
+            "Top candidates": ", ".join(f"{w} ({p:.2f})" for w, p in dist[:5])
+        })
+        if chosen in {".", "!", "?"}:
+            text += chosen
+        else:
+            text += (" " if text and not text.endswith(" ") else "") + chosen
+    return text, pd.DataFrame(steps)
+
+
+def sigmoid(z):
+    z = np.clip(z, -50, 50)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+ATTENTION_PRESETS = {
+    "Loan pronoun": {
+        "sentence": "The customer approached the bank because it offered a lower interest rate.",
+        "focus": "it",
+        "scores": {"bank": 0.42, "offered": 0.24, "rate": 0.13, "customer": 0.08, "interest": 0.08, "because": 0.05}
+    },
+    "Negation": {
+        "sentence": "The customer's repayment history was not good.",
+        "focus": "good",
+        "scores": {"not": 0.46, "repayment": 0.18, "history": 0.16, "customer's": 0.08, "was": 0.07, "the": 0.05}
+    },
+    "Credit risk": {
+        "sentence": "The loan was declined because repeated payment delays increased risk.",
+        "focus": "risk",
+        "scores": {"delays": 0.31, "payment": 0.20, "repeated": 0.16, "declined": 0.13, "loan": 0.10, "increased": 0.10}
+    }
+}
+
+
+def rag_chunks(text_value):
+    parts = [p.strip() for p in re.split(r"\n\s*\n|(?<=[.!?])\s+", str(text_value)) if len(p.strip()) >= 25]
+    return parts
+
+
+def rag_retrieve(query, document_text, top_k=3):
+    chunks = rag_chunks(document_text)
+    if not chunks:
+        return []
+    try:
+        vectorizer = TfidfVectorizer(stop_words="english")
+        X = vectorizer.fit_transform(chunks + [query])
+        q = X[-1]
+        docs = X[:-1]
+        scores = (docs @ q.T).toarray().ravel()
+        order = np.argsort(scores)[::-1][:min(top_k, len(chunks))]
+        return [(chunks[i], float(scores[i])) for i in order]
+    except Exception:
+        q_words = set(re.findall(r"\w+", query.lower()))
+        scored = []
+        for ch in chunks:
+            words = set(re.findall(r"\w+", ch.lower()))
+            scored.append((ch, len(q_words & words) / max(len(q_words), 1)))
+        return sorted(scored, key=lambda x: x[1], reverse=True)[:top_k]
+
+
+def _post_json(url, headers, payload, timeout=45):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def call_live_llm(provider, api_key, model, prompt, temperature=0.7):
+    """Optional live generation. API keys are used only for this request and are not persisted by this function."""
+    if not api_key.strip():
+        raise ValueError("API key is required.")
+    if not model.strip():
+        raise ValueError("Model name is required.")
+
+    if provider == "OpenAI":
+        url = "https://api.openai.com/v1/responses"
+        payload = {
+            "model": model.strip(),
+            "input": [{"role": "user", "content": prompt}],
+            "temperature": float(temperature)
+        }
+        result = _post_json(
+            url,
+            {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"},
+            payload
+        )
+        # Responses API: collect output_text content blocks if no convenience field is present.
+        if isinstance(result.get("output_text"), str):
+            return result["output_text"], result
+        pieces = []
+        for item in result.get("output", []):
+            for content in item.get("content", []) if isinstance(item, dict) else []:
+                if isinstance(content, dict) and content.get("type") == "output_text":
+                    pieces.append(content.get("text", ""))
+        return "\n".join(p for p in pieces if p).strip(), result
+
+    if provider == "Gemini":
+        safe_model = model.strip()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:generateContent"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": float(temperature)}
+        }
+        result = _post_json(
+            url,
+            {"x-goog-api-key": api_key.strip(), "Content-Type": "application/json"},
+            payload
+        )
+        pieces = []
+        for cand in result.get("candidates", []):
+            for part in cand.get("content", {}).get("parts", []):
+                if isinstance(part, dict) and "text" in part:
+                    pieces.append(part["text"])
+        return "\n".join(pieces).strip(), result
+
+    raise ValueError("Unsupported provider.")
+
+
+# ---------------------------------------------------------------------
 # NAVIGATION
 # ---------------------------------------------------------------------
 heartbeat()
@@ -1342,7 +1551,7 @@ if st.sidebar.button("Logout"):
 section = st.sidebar.selectbox("Choose learning area", [
     "Home", "Regression", "Classification", "K-Means Clustering",
     "Hierarchical Clustering", "PCA", "Semi-Supervised Learning",
-    "Reinforcement Learning", "NLP", "Feedback", "Admin Analytics"
+    "Reinforcement Learning", "NLP", "Generative AI", "Feedback", "Admin Analytics"
 ])
 log_event(section, "section_opened", {"city": st.session_state.get("user_city", "")})
 
@@ -3771,6 +3980,218 @@ elif section == "NLP":
             "TF-IDF identifies terms that are important relative to the collection. "
             "It is not a sentiment model by itself."
         )
+
+
+# ---------------------------------------------------------------------
+# GENERATIVE AI
+# ---------------------------------------------------------------------
+elif section == "Generative AI":
+    st.header("Generative AI Lab — From Neurons to RAG")
+    st.caption(
+        "A teaching lab for understanding the ideas behind modern GenAI. "
+        "The core demonstrations work without any external API. Live LLM calls are optional."
+    )
+    st.info(
+        "Teaching note: the simulated generation and attention views below are deliberately simplified. "
+        "They demonstrate concepts; they are not a reconstruction of a commercial LLM's hidden reasoning."
+    )
+
+    genai_mode = st.selectbox(
+        "Choose GenAI activity",
+        [
+            "1. Neural Network Basics",
+            "2. Tokens & Next-Token Generation",
+            "3. Temperature Playground",
+            "4. Transformer & Attention",
+            "5. Hallucination Lab",
+            "6. RAG Lab",
+            "7. Optional Live LLM"
+        ],
+        key="genai_mode"
+    )
+    log_event("Generative AI", "activity_opened", {"activity": genai_mode})
+
+    if genai_mode == "1. Neural Network Basics":
+        st.subheader("A single artificial neuron")
+        st.markdown(
+            "A neuron combines inputs using **weights**, adds a **bias**, and passes the result through an "
+            "activation function. Many connected neurons form a neural network."
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            income = st.slider("Income score", 0.0, 1.0, 0.70, 0.05)
+            w_income = st.slider("Weight: income", -3.0, 3.0, -0.8, 0.1)
+        with c2:
+            util = st.slider("Credit-utilisation score", 0.0, 1.0, 0.85, 0.05)
+            w_util = st.slider("Weight: utilisation", -3.0, 3.0, 1.8, 0.1)
+        with c3:
+            delay = st.slider("Repayment-delay score", 0.0, 1.0, 0.60, 0.05)
+            w_delay = st.slider("Weight: delay", -3.0, 3.0, 2.2, 0.1)
+        bias = st.slider("Bias", -3.0, 3.0, -1.0, 0.1)
+        z = income*w_income + util*w_util + delay*w_delay + bias
+        output = float(sigmoid(z))
+        st.latex(r"z=w_1x_1+w_2x_2+w_3x_3+b")
+        st.latex(r"\text{output}=\sigma(z)=\frac{1}{1+e^{-z}}")
+        m1, m2 = st.columns(2)
+        m1.metric("Weighted sum z", f"{z:.3f}")
+        m2.metric("Neuron output", f"{output:.3f}")
+        st.markdown(
+            "**Interpretation:** move a weight and observe how the output changes. During training, a neural network "
+            "learns many such weights so that prediction error reduces. A deep neural network contains multiple hidden layers."
+        )
+
+    elif genai_mode == "2. Tokens & Next-Token Generation":
+        st.subheader("LLMs generate text token by token")
+        prompt = st.text_input(
+            "Enter a starting prompt",
+            value="The bank rejected the loan because"
+        )
+        tokens = genai_tokenize(prompt)
+        st.write("**Illustrative tokens:**", tokens)
+        st.caption("Commercial LLMs use provider-specific tokenizers; this simple tokenizer is only for classroom illustration.")
+        temp = st.slider("Temperature", 0.1, 1.5, 0.7, 0.1, key="gen_next_temp")
+        dist, source_rule = next_token_distribution(prompt, temperature=temp, top_n=8)
+        if dist:
+            st.write(f"**Candidate next tokens ({source_rule}):**")
+            st.dataframe(
+                pd.DataFrame(dist, columns=["Candidate token", "Illustrative probability"]),
+                use_container_width=True,
+                hide_index=True
+            )
+        max_tokens = st.slider("Number of tokens to generate", 5, 40, 18, 1)
+        if st.button("Generate simulated continuation", key="gen_sim_button"):
+            out, steps = simulated_generate(prompt, temp, max_tokens, seed=42)
+            st.success(out)
+            st.dataframe(steps, use_container_width=True, hide_index=True)
+            st.caption(
+                "The demonstration repeatedly calculates a next-token distribution, selects a token, adds it to the context, and repeats. "
+                "A real LLM does this with a vastly larger learned neural network and vocabulary."
+            )
+
+    elif genai_mode == "3. Temperature Playground":
+        st.subheader("How temperature changes generation")
+        prompt = st.text_input("Prompt", value="The customer missed three loan payments", key="temp_prompt")
+        st.markdown("Generate the same prompt at three temperatures. Lower temperature concentrates probability on likely tokens; higher temperature spreads it more widely.")
+        if st.button("Compare temperatures", key="temp_compare"):
+            rows = []
+            for i, t in enumerate([0.2, 0.7, 1.3]):
+                out, _ = simulated_generate(prompt, temperature=t, max_tokens=18, seed=100+i)
+                rows.append({"Temperature": t, "Generated continuation": out})
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.warning("Temperature changes randomness/diversity; it does not make an answer factually correct.")
+
+    elif genai_mode == "4. Transformer & Attention":
+        st.subheader("Attention: which tokens matter for interpreting another token?")
+        preset = st.selectbox("Choose example", list(ATTENTION_PRESETS.keys()))
+        ex = ATTENTION_PRESETS[preset]
+        st.write(f"**Sentence:** {ex['sentence']}")
+        st.write(f"**Focus token:** `{ex['focus']}`")
+        att_df = pd.DataFrame(
+            [{"Token": tok, "Illustrative attention weight": score} for tok, score in ex["scores"].items()]
+        ).sort_values("Illustrative attention weight", ascending=False)
+        st.bar_chart(att_df.set_index("Token"))
+        st.dataframe(att_df, use_container_width=True, hide_index=True)
+        st.caption(
+            "This is a conceptual attention illustration, not attention weights extracted from a live LLM. "
+            "Self-attention lets each token build a context-sensitive representation using information from other tokens."
+        )
+        st.markdown(
+            "**Connection to _Attention Is All You Need_ (2017):** the Transformer replaced recurrence as the central sequence mechanism "
+            "with attention-based processing, enabling efficient contextual modelling and large-scale training."
+        )
+
+    elif genai_mode == "5. Hallucination Lab":
+        st.subheader("Why fluent output can still be wrong")
+        st.markdown(
+            "Imagine asking a general-purpose LLM about a private bank policy it has never been given. "
+            "A language model is optimized to generate plausible continuations, not to guarantee that an internal policy clause exists."
+        )
+        question = st.text_input(
+            "Internal-policy question",
+            value="What is the maximum unsecured personal-loan amount under ABC Bank Policy 2026?"
+        )
+        if st.button("Show hallucination scenario"):
+            st.error(
+                "Illustrative ungrounded answer: 'Under Clause 8.4 of ABC Bank Policy 2026, the maximum unsecured personal loan is ₹30 lakh.'"
+            )
+            st.write("**Problem:** the clause and amount were never supplied to the model. The sentence sounds authoritative but is unsupported.")
+            st.write("**Lesson:** fluency ≠ factual correctness. High-stakes BFSI answers require grounding and verification.")
+        st.caption("This section intentionally uses a fabricated example and does not call an external model.")
+
+    elif genai_mode == "6. RAG Lab":
+        st.subheader("Retrieval-Augmented Generation (RAG)")
+        default_policy = (
+            "ABC Bank Personal Loan Policy 2026.\n\n"
+            "Section 4.2 — Maximum Loan Amount. The maximum unsecured personal-loan amount is ₹20 lakh, subject to eligibility and affordability checks.\n\n"
+            "Section 5.1 — Repayment History. Applicants with active severe delinquency are not eligible for a fresh enhancement until regularisation.\n\n"
+            "Section 6.3 — Required Documents. Salaried applicants must provide identity proof, address proof, recent salary slips and bank statements.\n\n"
+            "Section 8.1 — Human Review. Final approval remains with an authorised credit officer."
+        )
+        policy_text = st.text_area("Paste a small policy / knowledge-base text", value=default_policy, height=240)
+        query = st.text_input("Ask a question about the policy", value="What is the maximum unsecured personal-loan amount?")
+        top_k = st.slider("Number of passages to retrieve", 1, 5, 2)
+        if st.button("Retrieve relevant passages", key="rag_retrieve"):
+            retrieved = rag_retrieve(query, policy_text, top_k=top_k)
+            st.session_state["rag_last_retrieved"] = retrieved
+        retrieved = st.session_state.get("rag_last_retrieved", [])
+        if retrieved:
+            st.write("**Retrieved context:**")
+            for i, (chunk, score) in enumerate(retrieved, 1):
+                st.markdown(f"**Passage {i} — relevance {score:.3f}**\n\n{chunk}")
+            st.success(
+                "Grounded teaching answer: Based on the retrieved policy text, the maximum unsecured personal-loan amount is ₹20 lakh, subject to eligibility and affordability checks."
+            )
+            st.caption(
+                "RAG first retrieves relevant authoritative text, then supplies that context to the generator. "
+                "The knowledge source can be updated without retraining the entire LLM."
+            )
+
+    elif genai_mode == "7. Optional Live LLM":
+        st.subheader("Optional live generation using your own API key")
+        st.warning(
+            "Use only a personal/test API key that you are permitted to use. Do not paste institutional secrets or confidential customer data. "
+            "The key is used for the current request only and is not written to this app's analytics database. Provider billing/rate limits may apply."
+        )
+        provider = st.selectbox("Provider", ["OpenAI", "Gemini"])
+        if provider == "OpenAI":
+            default_model = "gpt-4.1-mini"
+            st.caption("Uses OpenAI's Responses API. You may replace the model with another model available to your API account.")
+        else:
+            default_model = "gemini-2.5-flash"
+            st.caption("Uses Google's Gemini generateContent REST API. You may replace the model if your account supports another one.")
+        api_key = st.text_input(f"{provider} API key", type="password", key="genai_api_key")
+        model = st.text_input("Model", value=default_model, key="genai_model")
+        prompt = st.text_area(
+            "Prompt",
+            value="Explain in simple language why a bank should not rely on an ungrounded LLM for internal policy questions.",
+            height=140,
+            key="genai_live_prompt"
+        )
+        temperature = st.slider("Temperature", 0.0, 1.5, 0.5, 0.1, key="genai_live_temp")
+        if st.button("Generate with live LLM", key="genai_live_button"):
+            if not api_key:
+                st.error("Enter an API key first.")
+            else:
+                try:
+                    with st.spinner("Calling the selected provider..."):
+                        answer, raw = call_live_llm(provider, api_key, model, prompt, temperature)
+                    if answer:
+                        st.success("Live model response")
+                        st.write(answer)
+                        st.caption(
+                            "This is a provider-generated response. The app does not expose or claim to show the model's private internal reasoning."
+                        )
+                        log_event("Generative AI", "live_llm_used", {"provider": provider, "model": model})
+                    else:
+                        st.error("The provider returned no displayable text.")
+                except urllib.error.HTTPError as e:
+                    try:
+                        detail = e.read().decode("utf-8")[:1200]
+                    except Exception:
+                        detail = str(e)
+                    st.error(f"Provider returned HTTP {e.code}. {detail}")
+                except Exception as e:
+                    st.error(f"Live generation failed: {e}")
 
 
 # ---------------------------------------------------------------------
