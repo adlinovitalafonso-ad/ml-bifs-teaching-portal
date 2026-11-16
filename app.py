@@ -1688,6 +1688,20 @@ def extract_genai_file(uploaded):
     raise ValueError('Unsupported file type.')
 
 
+
+
+def _set_visual_generation_prompt(new_text, chosen_token=None, chosen_probability=None, reset_history=False):
+    """Safely update the GenAI prompt from a Streamlit button callback."""
+    st.session_state["visual_gen_prompt"] = str(new_text)
+    st.session_state["vis_gen_text"] = str(new_text)
+    st.session_state["vis_gen_stage"] = 0
+    if reset_history:
+        st.session_state["vis_gen_history"] = []
+    elif chosen_token is not None:
+        hist = list(st.session_state.get("vis_gen_history", []))
+        hist.append((str(chosen_token), float(chosen_probability or 0.0)))
+        st.session_state["vis_gen_history"] = hist
+
 # ---------------------------------------------------------------------
 # NAVIGATION
 # ---------------------------------------------------------------------
@@ -4177,6 +4191,8 @@ elif section == "Generative AI":
 
         if 'vis_gen_text' not in st.session_state:
             st.session_state.vis_gen_text = "The bank rejected the loan because"
+        if 'visual_gen_prompt' not in st.session_state:
+            st.session_state.visual_gen_prompt = st.session_state.vis_gen_text
         if 'vis_gen_stage' not in st.session_state:
             st.session_state.vis_gen_stage = 0
         if 'vis_gen_history' not in st.session_state:
@@ -4184,9 +4200,9 @@ elif section == "Generative AI":
 
         prompt_input = st.text_input(
             "Enter a sentence / prompt",
-            value=st.session_state.vis_gen_text,
             key="visual_gen_prompt"
         )
+        st.session_state.vis_gen_text = prompt_input
         temperature = st.slider(
             "Temperature", 0.1, 1.5, 0.7, 0.1, key="visual_gen_temperature",
             help="Lower values concentrate probability on the strongest candidates; higher values spread probability more widely."
@@ -4197,11 +4213,12 @@ elif section == "Generative AI":
             st.session_state.vis_gen_stage = max(0, st.session_state.vis_gen_stage - 1)
         if cnext.button("Next stage →", key="gen_next"):
             st.session_state.vis_gen_stage = min(6, st.session_state.vis_gen_stage + 1)
-        if creset.button("Reset walkthrough", key="gen_reset"):
-            st.session_state.vis_gen_stage = 0
-            st.session_state.vis_gen_history = []
-            st.session_state.vis_gen_text = prompt_input
-            st.rerun()
+        creset.button(
+            "Reset walkthrough",
+            key="gen_reset",
+            on_click=_set_visual_generation_prompt,
+            args=(prompt_input, None, None, True)
+        )
 
         trace = transparent_next_token(prompt_input, temperature)
         stage = st.session_state.vis_gen_stage
@@ -4219,8 +4236,14 @@ elif section == "Generative AI":
                 st.caption("A real tokenizer may split words into subword tokens. Here we keep the tokenization simple so the class can follow the calculations.")
 
         if stage >= 1:
-            emb_df = pd.DataFrame(trace['E'], index=trace['tokens'], columns=[f"e{i+1}" for i in range(_TOY_D)])
+            emb_df = pd.DataFrame(
+                trace['E'],
+                index=trace['tokens'],
+                columns=[f"Dimension {i+1}" for i in range(_TOY_D)]
+            )
+            emb_df.index.name = "Token"
             st.write("**Small embedding vectors (embedding + position information)**")
+            st.caption("Each ROW is one token. Each COLUMN is one numerical dimension of that token's embedding vector. This teaching model uses only 4 dimensions so the numbers are inspectable; real LLM embeddings have many more dimensions.")
             st.dataframe(emb_df.round(3), use_container_width=True)
             st.latex(r"x_i = \text{Embedding}(token_i) + \text{Position}(i)")
             if stage == 1:
@@ -4282,13 +4305,13 @@ elif section == "Generative AI":
             st.markdown("Now the added token becomes part of the input, and **the entire process runs again** for the following token.")
 
             c1, c2 = st.columns(2)
-            if c1.button("Append chosen token and repeat", key="append_repeat"):
-                new_text = (prompt_input.rstrip() + " " + chosen).strip()
-                st.session_state.vis_gen_text = new_text
-                st.session_state.visual_gen_prompt = new_text
-                st.session_state.vis_gen_history.append((chosen, top_p))
-                st.session_state.vis_gen_stage = 0
-                st.rerun()
+            new_text = (prompt_input.rstrip() + " " + chosen).strip()
+            c1.button(
+                "Append chosen token and repeat",
+                key="append_repeat",
+                on_click=_set_visual_generation_prompt,
+                args=(new_text, chosen, top_p, False)
+            )
             if c2.button("Generate 8 tokens automatically", key="auto_8"):
                 text_now = prompt_input.strip()
                 rows = []
