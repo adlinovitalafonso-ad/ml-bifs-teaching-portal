@@ -1526,315 +1526,167 @@ def call_live_llm(provider, api_key, model, prompt, temperature=0.7):
     raise ValueError("Unsupported provider.")
 
 
+
+
 # ---------------------------------------------------------------------
-# TINY TRANSFORMER HELPERS FOR THE GENAI LAB
+# VISUAL / TRANSPARENT GENAI HELPERS
 # ---------------------------------------------------------------------
-TINY_LM_CORPUS = [
-    "the bank approved the loan after reviewing income and repayment history",
-    "the bank rejected the loan because the customer had repeated repayment delays",
-    "the customer missed three loan payments and the account became delinquent",
-    "high credit utilization can increase default risk",
-    "strong repayment history can reduce default risk",
-    "the credit officer reviewed income debt utilization and repayment history",
-    "the bank offered restructuring to the delinquent borrower",
-    "the borrower accepted restructuring and resumed regular repayment",
-    "the insurer reviewed the claim documents before approving the settlement",
-    "the insurer rejected the claim because a policy exclusion applied",
-    "the language model predicts the next token from the preceding context",
-    "the transformer uses attention to relate each token to relevant context",
-    "retrieval augmented generation retrieves relevant documents before generation",
-    "rag can ground the model in current internal policy documents",
-    "a hallucination is a fluent but unsupported generated statement",
-    "the model invented a policy clause that did not exist",
+def _softmax_np(values, temperature=1.0):
+    arr = np.asarray(values, dtype=float) / max(float(temperature), 0.05)
+    arr = arr - np.max(arr)
+    exp = np.exp(arr)
+    return exp / max(exp.sum(), 1e-12)
+
+
+def _stable_token_vector(token, dim=6):
+    """Deterministic small embedding used only for the transparent classroom model."""
+    seed = sum((i + 1) * ord(ch) for i, ch in enumerate(str(token).lower())) % (2**32 - 1)
+    rng = np.random.default_rng(seed)
+    v = rng.normal(0, 0.7, dim)
+    norm = np.linalg.norm(v)
+    return v / norm if norm else v
+
+
+_TOY_D = 6
+_TOY_RNG = np.random.default_rng(2026)
+_TOY_WQ = _TOY_RNG.normal(0, 0.55, (_TOY_D, _TOY_D))
+_TOY_WK = _TOY_RNG.normal(0, 0.55, (_TOY_D, _TOY_D))
+_TOY_WV = _TOY_RNG.normal(0, 0.55, (_TOY_D, _TOY_D))
+
+
+def _position_vector(position, dim=_TOY_D):
+    out = np.zeros(dim)
+    for i in range(0, dim, 2):
+        denom = 10000 ** (i / max(dim, 1))
+        out[i] = np.sin(position / denom)
+        if i + 1 < dim:
+            out[i + 1] = np.cos(position / denom)
+    return out * 0.18
+
+
+def transparent_attention(prompt):
+    tokens = [t.lower() for t in genai_tokenize(prompt) if re.search(r'\w', t)]
+    if not tokens:
+        tokens = ['bank']
+    tokens = tokens[-10:]
+    E = np.vstack([_stable_token_vector(t) + _position_vector(i) for i, t in enumerate(tokens)])
+    Q = E @ _TOY_WQ
+    K = E @ _TOY_WK
+    V = E @ _TOY_WV
+    q = Q[-1]
+    scores = (K @ q) / np.sqrt(_TOY_D)
+    weights = _softmax_np(scores)
+    context = weights @ V
+    return {
+        'tokens': tokens, 'E': E, 'Q': Q, 'K': K, 'V': V,
+        'scores': scores, 'weights': weights, 'context': context
+    }
+
+
+_TOY_OUTPUT_VOCAB = [
+    'the','a','customer','loan','bank','was','is','because','approved','rejected',
+    'payment','risk','income','credit','policy','repayment','high','low','after','and',
+    'had','missed','documents','reviewed','default','delays','history','amount','eligible',
+    'officer','account','borrower','interest','rate','claim','insurance','may','can','not'
 ]
 
 
-def tiny_lm_tokenize(text_value):
-    return [t.lower() for t in re.findall(r"[A-Za-z0-9₹$%]+(?:[-'][A-Za-z0-9]+)*|[^\w\s]", str(text_value))]
+def transparent_next_token(prompt, temperature=0.7):
+    trace = transparent_attention(prompt)
+    context = trace['context']
+    candidate_vecs = np.vstack([_stable_token_vector(w) for w in _TOY_OUTPUT_VOCAB])
+    semantic_logits = candidate_vecs @ context
 
-
-def tiny_lm_vocab():
-    special = ["<pad>", "<unk>"]
-    words = sorted({tok for sent in TINY_LM_CORPUS for tok in tiny_lm_tokenize(sent)})
-    vocab = special + words
-    stoi = {w: i for i, w in enumerate(vocab)}
-    itos = {i: w for w, i in stoi.items()}
-    return stoi, itos
-
-
-def _torch_available():
-    try:
-        import torch  # noqa: F401
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-
-def _make_tiny_training_data(stoi, context_len=6):
-    import torch
-    X, y = [], []
-    pad = stoi["<pad>"]
-    unk = stoi["<unk>"]
-    for sentence in TINY_LM_CORPUS:
-        ids = [stoi.get(tok, unk) for tok in tiny_lm_tokenize(sentence)]
-        for i in range(1, len(ids)):
-            context = ids[max(0, i-context_len):i]
-            context = [pad] * (context_len - len(context)) + context
-            X.append(context)
-            y.append(ids[i])
-    return torch.tensor(X, dtype=torch.long), torch.tensor(y, dtype=torch.long)
-
-
-def _tiny_transformer_class(vocab_size, context_len=6, d_model=24, n_heads=2, ff_dim=48):
-    import torch
-    import torch.nn as nn
-
-    class TinyTransformerLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.context_len = context_len
-            self.token_embedding = nn.Embedding(vocab_size, d_model)
-            self.position_embedding = nn.Embedding(context_len, d_model)
-            self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-            self.norm1 = nn.LayerNorm(d_model)
-            self.ff = nn.Sequential(
-                nn.Linear(d_model, ff_dim),
-                nn.ReLU(),
-                nn.Linear(ff_dim, d_model),
-            )
-            self.norm2 = nn.LayerNorm(d_model)
-            self.output = nn.Linear(d_model, vocab_size)
-
-        def forward(self, x, return_details=False):
-            batch, seq_len = x.shape
-            pos = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch, -1)
-            emb = self.token_embedding(x) + self.position_embedding(pos)
-            # Causal mask: a position cannot attend to positions to its right.
-            causal_mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1
-            )
-            attn_out, attn_weights = self.attn(
-                emb, emb, emb,
-                attn_mask=causal_mask,
-                need_weights=True,
-                average_attn_weights=False,
-            )
-            h1 = self.norm1(emb + attn_out)
-            ff_out = self.ff(h1)
-            h2 = self.norm2(h1 + ff_out)
-            logits_all = self.output(h2)
-            logits = logits_all[:, -1, :]
-            if return_details:
-                return logits, {
-                    "embeddings": emb,
-                    "attention": attn_weights,
-                    "hidden": h2,
-                    "logits_all": logits_all,
-                }
-            return logits
-
-    return TinyTransformerLM
-
-
-def train_tiny_transformer(epochs=120, learning_rate=0.03, seed=7):
-    import torch
-    import torch.nn.functional as F
-
-    torch.manual_seed(int(seed))
-    np.random.seed(int(seed))
-    stoi, itos = tiny_lm_vocab()
-    context_len = 6
-    X, y = _make_tiny_training_data(stoi, context_len=context_len)
-    ModelClass = _tiny_transformer_class(len(stoi), context_len=context_len)
-    model = ModelClass()
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(learning_rate))
-
-    initial_output = model.output.weight.detach().cpu().numpy().copy()
-    history = []
-    gradient_history = []
-
-    for epoch in range(int(epochs)):
-        model.train()
-        optimizer.zero_grad()
-        logits = model(X)
-        loss = F.cross_entropy(logits, y)
-        loss.backward()
-        grad_norm = float(model.output.weight.grad.detach().norm().cpu())
-        optimizer.step()
-        history.append(float(loss.detach().cpu()))
-        gradient_history.append(grad_norm)
-
-    final_output = model.output.weight.detach().cpu().numpy().copy()
-    model.eval()
-    return {
-        "model": model,
-        "stoi": stoi,
-        "itos": itos,
-        "context_len": context_len,
-        "history": history,
-        "gradient_history": gradient_history,
-        "initial_output": initial_output,
-        "final_output": final_output,
-        "X": X,
-        "y": y,
-    }
-
-
-@st.cache_resource(show_spinner=False)
-def get_default_tiny_transformer():
-    ok, err = _torch_available()
-    if not ok:
-        return None, err
-    try:
-        return train_tiny_transformer(epochs=140, learning_rate=0.025, seed=7), None
-    except Exception as e:
-        return None, str(e)
-
-
-def tiny_transformer_context(text_value, stoi, context_len=6):
-    import torch
-    toks = tiny_lm_tokenize(text_value)
-    ids = [stoi.get(tok, stoi["<unk>"]) for tok in toks][-context_len:]
-    shown_tokens = toks[-context_len:]
-    pads = context_len - len(ids)
-    ids = [stoi["<pad>"]] * pads + ids
-    shown_tokens = ["<pad>"] * pads + shown_tokens
-    return torch.tensor([ids], dtype=torch.long), shown_tokens
-
-
-def inspect_tiny_transformer(bundle, text_value, temperature=1.0, top_k=8):
-    import torch
-    import torch.nn.functional as F
-
-    model = bundle["model"]
-    stoi, itos = bundle["stoi"], bundle["itos"]
-    x, shown_tokens = tiny_transformer_context(text_value, stoi, bundle["context_len"])
-    model.eval()
-    with torch.no_grad():
-        logits, details = model(x, return_details=True)
-        raw_logits = logits[0]
-        probs = F.softmax(raw_logits / max(float(temperature), 0.05), dim=-1)
-        values, indices = torch.topk(probs, k=min(int(top_k), probs.numel()))
-
-    candidates = pd.DataFrame({
-        "Token": [itos[int(i)] for i in indices.cpu().numpy()],
-        "Logit": [float(raw_logits[int(i)].cpu()) for i in indices.cpu().numpy()],
-        "Probability": [float(v) for v in values.cpu().numpy()],
-    })
-
-    # Token embeddings only (before adding position embeddings) are easiest to interpret pedagogically.
-    with torch.no_grad():
-        token_ids = x[0]
-        token_emb = model.token_embedding(token_ids).cpu().numpy()
-    emb_cols = [f"E{i+1}" for i in range(min(6, token_emb.shape[1]))]
-    emb_df = pd.DataFrame(token_emb[:, :len(emb_cols)], columns=emb_cols)
-    emb_df.insert(0, "Token", shown_tokens)
-
-    attn = details["attention"][0].mean(dim=0).cpu().numpy()  # mean over heads
-    # Show attention paid by the final context position to all context positions.
-    attn_df = pd.DataFrame({
-        "Context token": shown_tokens,
-        "Attention from final token": attn[-1],
-    })
-    return candidates, emb_df, attn_df, x
-
-
-def generate_with_tiny_transformer(bundle, prompt, steps=10, temperature=0.8, strategy="Sample", seed=42):
-    import torch
-    import torch.nn.functional as F
-
-    torch.manual_seed(int(seed))
-    text = str(prompt).strip()
-    trace = []
-    model = bundle["model"]
-    stoi, itos = bundle["stoi"], bundle["itos"]
-
-    for step in range(int(steps)):
-        x, shown_tokens = tiny_transformer_context(text, stoi, bundle["context_len"])
-        with torch.no_grad():
-            logits, details = model(x, return_details=True)
-            probs = F.softmax(logits[0] / max(float(temperature), 0.05), dim=-1)
-
-        # Never generate padding or unknown tokens in the classroom demo.
-        probs[stoi["<pad>"]] = 0
-        probs[stoi["<unk>"]] = 0
-        probs = probs / probs.sum()
-        top_vals, top_idx = torch.topk(probs, k=min(5, probs.numel()))
-        if strategy == "Greedy":
-            chosen_id = int(torch.argmax(probs).item())
+    # A tiny corpus prior makes the classroom output linguistically less arbitrary,
+    # while the attention calculation above remains fully visible.
+    toks = [t.lower() for t in genai_tokenize(prompt) if re.search(r'\w', t)]
+    last = toks[-1] if toks else ''
+    bigram_counts = GENAI_BIGRAM.get((last,), {})
+    total_uni = sum(GENAI_UNIGRAM.values()) + len(_TOY_OUTPUT_VOCAB)
+    prior = []
+    for w in _TOY_OUTPUT_VOCAB:
+        if bigram_counts:
+            denom = sum(bigram_counts.values()) + len(_TOY_OUTPUT_VOCAB)
+            p = (bigram_counts.get(w, 0) + 0.25) / denom
         else:
-            chosen_id = int(torch.multinomial(probs, 1).item())
-        chosen = itos[chosen_id]
-        trace.append({
-            "Step": step + 1,
-            "Chosen token": chosen,
-            "Chosen probability": float(probs[chosen_id].cpu()),
-            "Top candidates": ", ".join(
-                f"{itos[int(i)]} ({float(v):.2f})" for v, i in zip(top_vals.cpu(), top_idx.cpu())
-            ),
-        })
-        text += ("" if chosen in {".", ",", "!", "?"} else " ") + chosen
-    return text, pd.DataFrame(trace)
-
-
-def tiny_forward_pass_details(bundle, sample_index=0):
-    import torch
-    import torch.nn.functional as F
-
-    model = bundle["model"]
-    X, y = bundle["X"], bundle["y"]
-    idx = int(max(0, min(sample_index, len(X)-1)))
-    x = X[idx:idx+1]
-    target = y[idx:idx+1]
-    model.eval()
-    with torch.no_grad():
-        logits, details = model(x, return_details=True)
-        probs = F.softmax(logits, dim=-1)
-        loss = F.cross_entropy(logits, target)
-    itos = bundle["itos"]
-    tokens = [itos[int(i)] for i in x[0].cpu().numpy()]
-    target_token = itos[int(target.item())]
-    top_vals, top_idx = torch.topk(probs[0], k=min(6, probs.shape[-1]))
-    prob_df = pd.DataFrame({
-        "Candidate token": [itos[int(i)] for i in top_idx.cpu().numpy()],
-        "Probability": [float(v) for v in top_vals.cpu().numpy()],
+            p = (GENAI_UNIGRAM.get(w, 0) + 0.25) / total_uni
+        prior.append(np.log(max(p, 1e-9)))
+    prior = np.asarray(prior)
+    logits = 0.75 * semantic_logits + 1.10 * prior
+    probs = _softmax_np(logits, temperature=temperature)
+    order = np.argsort(probs)[::-1]
+    trace.update({
+        'vocab': _TOY_OUTPUT_VOCAB, 'logits': logits, 'probs': probs, 'order': order
     })
-    attn = details["attention"][0].mean(dim=0).cpu().numpy()
-    attn_df = pd.DataFrame(attn, index=tokens, columns=tokens)
-    hidden = details["hidden"][0, -1].cpu().numpy()
+    return trace
+
+
+def _nn_initial_state(vocab_size=5, hidden=3):
+    rng = np.random.default_rng(17)
     return {
-        "tokens": tokens,
-        "target_token": target_token,
-        "loss": float(loss.cpu()),
-        "probabilities": prob_df,
-        "attention_matrix": attn_df,
-        "hidden": hidden,
+        'W1': rng.normal(0, 0.35, (vocab_size, hidden)),
+        'b1': np.zeros(hidden),
+        'W2': rng.normal(0, 0.35, (hidden, vocab_size)),
+        'b2': np.zeros(vocab_size),
+        'loss_history': []
     }
 
 
-def extract_uploaded_document(uploaded_file):
-    name = uploaded_file.name.lower()
-    data = uploaded_file.getvalue()
-    if name.endswith(".txt"):
-        return data.decode("utf-8", errors="replace")
-    if name.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(data))
-        return df.astype(str).apply(lambda r: " | ".join(r.values), axis=1).str.cat(sep="\n")
-    if name.endswith(".pdf"):
+def _nn_forward(state, input_idx, target_idx):
+    V = state['W1'].shape[0]
+    x = np.zeros(V); x[input_idx] = 1.0
+    z1 = x @ state['W1'] + state['b1']
+    a1 = np.tanh(z1)
+    z2 = a1 @ state['W2'] + state['b2']
+    probs = _softmax_np(z2)
+    y = np.zeros(V); y[target_idx] = 1.0
+    loss = -np.log(max(probs[target_idx], 1e-12))
+    return {'x':x,'z1':z1,'a1':a1,'z2':z2,'probs':probs,'y':y,'loss':float(loss)}
+
+
+def _nn_backprop(state, cache, lr):
+    dZ2 = cache['probs'] - cache['y']
+    dW2 = np.outer(cache['a1'], dZ2)
+    db2 = dZ2.copy()
+    dA1 = state['W2'] @ dZ2
+    dZ1 = dA1 * (1.0 - cache['a1'] ** 2)
+    dW1 = np.outer(cache['x'], dZ1)
+    db1 = dZ1.copy()
+    grads = {'dW1':dW1,'db1':db1,'dW2':dW2,'db2':db2}
+    new_state = {
+        'W1': state['W1'] - lr*dW1,
+        'b1': state['b1'] - lr*db1,
+        'W2': state['W2'] - lr*dW2,
+        'b2': state['b2'] - lr*db2,
+        'loss_history': list(state.get('loss_history', []))
+    }
+    return new_state, grads
+
+
+def extract_genai_file(uploaded):
+    name = uploaded.name.lower()
+    if name.endswith('.txt'):
+        return uploaded.getvalue().decode('utf-8', errors='ignore')
+    if name.endswith('.csv'):
+        uploaded.seek(0)
+        df = pd.read_csv(uploaded)
+        return df.astype(str).apply(lambda r: ' | '.join(r.values), axis=1).str.cat(sep='\n')
+    if name.endswith('.pdf'):
         try:
             from pypdf import PdfReader
         except Exception as e:
-            raise RuntimeError("PDF support requires pypdf in requirements.txt") from e
-        reader = PdfReader(io.BytesIO(data))
-        return "\n\n".join((page.extract_text() or "") for page in reader.pages)
-    if name.endswith(".docx"):
+            raise RuntimeError('PDF support needs pypdf in requirements.txt') from e
+        reader = PdfReader(uploaded)
+        return '\n'.join((page.extract_text() or '') for page in reader.pages)
+    if name.endswith('.docx'):
         try:
             from docx import Document
         except Exception as e:
-            raise RuntimeError("DOCX support requires python-docx in requirements.txt") from e
-        doc = Document(io.BytesIO(data))
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    raise ValueError("Supported file types: TXT, CSV, PDF and DOCX.")
+            raise RuntimeError('DOCX support needs python-docx in requirements.txt') from e
+        doc = Document(uploaded)
+        return '\n'.join(p.text for p in doc.paragraphs)
+    raise ValueError('Unsupported file type.')
+
 
 # ---------------------------------------------------------------------
 # NAVIGATION
@@ -4296,332 +4148,396 @@ elif section == "NLP":
 # GENERATIVE AI
 # ---------------------------------------------------------------------
 elif section == "Generative AI":
-    st.header("Generative AI Lab — How Text Is Learned and Generated")
+    st.header("Generative AI — See the Computation")
     st.caption(
-        "Four connected demonstrations: inspect next-token generation, train a transparent tiny Transformer, "
-        "try a live LLM, or ask questions about an uploaded document."
+        "A transparent classroom simulator: first watch a Transformer-style next-token calculation, "
+        "then watch a neural network learn by forward propagation and backpropagation."
     )
     st.info(
-        "The local Transformer is intentionally tiny and trained on a small teaching corpus. It uses real embeddings, "
-        "self-attention, neural-network weights, softmax probabilities and backpropagation, but it is not comparable in scale "
-        "or capability to a commercial LLM."
+        "The local models below are intentionally tiny so every number can be inspected. They demonstrate the same core "
+        "ideas used at much larger scale in LLMs; they are not reconstructions of ChatGPT or another commercial model."
     )
 
-    tab_generate, tab_train, tab_live, tab_file = st.tabs([
-        "1. Generation Explorer",
-        "2. Train Tiny Transformer",
-        "3. Live LLM API",
-        "4. Ask a File",
+    tab_gen, tab_train, tab_api, tab_file = st.tabs([
+        "1 · How the next token is produced",
+        "2 · Forward pass & backpropagation",
+        "3 · Try a real LLM",
+        "4 · Ask a file (RAG)"
     ])
 
-    # -------------------------------------------------------------
-    # TAB 1 — GENERATION EXPLORER
-    # -------------------------------------------------------------
-    with tab_generate:
-        st.subheader("From prompt to the next token")
+    # ================================================================
+    # TAB 1 — NEXT TOKEN, STEP BY STEP
+    # ================================================================
+    with tab_gen:
+        st.subheader("Watch one next-token decision from beginning to end")
         st.markdown(
-            "Enter a sentence or question. The tiny Transformer converts tokens to **embedding vectors**, applies "
-            "**self-attention**, produces **logits**, converts them to **probabilities with softmax**, chooses the next token, "
-            "adds it to the context, and repeats."
+            "The important idea is **predict → choose one token → append it → run the whole calculation again**. "
+            "Use **Next stage** to reveal only one part of the calculation at a time."
         )
 
-        bundle, tiny_err = get_default_tiny_transformer()
-        if bundle is None:
-            st.error("The local Transformer could not be loaded. Install PyTorch to enable this activity.")
-            st.caption(str(tiny_err))
-        else:
-            prompt = st.text_area(
-                "Enter a prompt",
-                value="the bank rejected the loan because",
-                height=90,
-                key="genai_generation_prompt",
-            )
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                temperature = st.slider("Temperature", 0.1, 1.5, 0.7, 0.1, key="tiny_gen_temp")
-            with c2:
-                strategy = st.selectbox("Token choice", ["Greedy", "Sample"], key="tiny_gen_strategy")
-            with c3:
-                steps = st.slider("Tokens to generate", 1, 20, 8, 1, key="tiny_gen_steps")
+        if 'vis_gen_text' not in st.session_state:
+            st.session_state.vis_gen_text = "The bank rejected the loan because"
+        if 'vis_gen_stage' not in st.session_state:
+            st.session_state.vis_gen_stage = 0
+        if 'vis_gen_history' not in st.session_state:
+            st.session_state.vis_gen_history = []
 
-            candidates, emb_df, attn_df, _ = inspect_tiny_transformer(
-                bundle, prompt, temperature=temperature, top_k=8
-            )
-
-            st.markdown("### Step A — Tokenization and vector embeddings")
-            st.write("**Current tokens:**", tiny_lm_tokenize(prompt))
-            st.dataframe(emb_df, use_container_width=True, hide_index=True)
-            st.caption(
-                "Each token is represented by a learned vector. Only the first six embedding dimensions are shown here; "
-                "the tiny model actually uses a 24-dimensional embedding."
-            )
-
-            st.markdown("### Step B — Self-attention")
-            st.dataframe(attn_df, use_container_width=True, hide_index=True)
-            fig, ax = plt.subplots(figsize=(8, 3.8))
-            ax.bar(attn_df["Context token"], attn_df["Attention from final token"])
-            ax.set_ylabel("Attention weight")
-            ax.set_title("Where the final context token attends")
-            ax.tick_params(axis="x", rotation=35)
-            st.pyplot(fig)
-            st.caption(
-                "These are actual attention weights from the tiny local Transformer. Attention determines how strongly "
-                "the current representation draws information from earlier context positions."
-            )
-
-            st.markdown("### Step C — Logits → softmax probabilities")
-            st.dataframe(candidates, use_container_width=True, hide_index=True)
-            st.latex(r"P(token_i)=\frac{e^{z_i/T}}{\sum_j e^{z_j/T}}")
-            st.caption(
-                "The neural network produces one logit z for every token in its vocabulary. Softmax turns those logits into "
-                "probabilities. Temperature T changes how concentrated or spread out the probabilities are."
-            )
-
-            if strategy == "Greedy":
-                next_token = candidates.iloc[0]["Token"]
-                st.success(f"Greedy choice: **{next_token}** because it has the highest probability.")
-            else:
-                st.info("Sampling does not always choose the highest-probability token; it draws from the probability distribution.")
-
-            if st.button("Generate continuation step by step", key="tiny_generate_button"):
-                generated, trace = generate_with_tiny_transformer(
-                    bundle, prompt, steps=steps, temperature=temperature,
-                    strategy=strategy, seed=42
-                )
-                st.markdown("### Generated text")
-                st.success(generated)
-                st.markdown("### Generation trace")
-                st.dataframe(trace, use_container_width=True, hide_index=True)
-                st.caption(
-                    "At every row, the chosen token is appended to the text and the entire next-token calculation is repeated. "
-                    "This repeated prediction cycle is the core idea behind autoregressive text generation."
-                )
-                log_event("Generative AI", "tiny_generation_used", {"strategy": strategy, "temperature": temperature})
-
-    # -------------------------------------------------------------
-    # TAB 2 — TRAIN THE TINY TRANSFORMER
-    # -------------------------------------------------------------
-    with tab_train:
-        st.subheader("See learning: feed-forward → loss → backpropagation → weight update")
-        st.markdown(
-            "This activity trains a tiny one-block Transformer language model on a small BFSI teaching corpus. "
-            "The objective is to predict the next token. Training adjusts embeddings, attention parameters, feed-forward "
-            "weights and the output layer to reduce cross-entropy loss."
+        prompt_input = st.text_input(
+            "Enter a sentence / prompt",
+            value=st.session_state.vis_gen_text,
+            key="visual_gen_prompt"
+        )
+        temperature = st.slider(
+            "Temperature", 0.1, 1.5, 0.7, 0.1, key="visual_gen_temperature",
+            help="Lower values concentrate probability on the strongest candidates; higher values spread probability more widely."
         )
 
-        ok, torch_err = _torch_available()
-        if not ok:
-            st.error("PyTorch is required for this activity.")
-            st.caption(str(torch_err))
-        else:
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                epochs = st.slider("Training epochs", 20, 250, 100, 10, key="tiny_train_epochs")
-            with c2:
-                lr = st.select_slider(
-                    "Learning rate",
-                    options=[0.001, 0.003, 0.01, 0.02, 0.03, 0.05],
-                    value=0.02,
-                    key="tiny_train_lr",
-                )
-            with c3:
-                seed = st.number_input("Random seed", 1, 999, 7, 1, key="tiny_train_seed")
+        cprev, cnext, creset = st.columns([1,1,1])
+        if cprev.button("← Previous stage", key="gen_prev"):
+            st.session_state.vis_gen_stage = max(0, st.session_state.vis_gen_stage - 1)
+        if cnext.button("Next stage →", key="gen_next"):
+            st.session_state.vis_gen_stage = min(6, st.session_state.vis_gen_stage + 1)
+        if creset.button("Reset walkthrough", key="gen_reset"):
+            st.session_state.vis_gen_stage = 0
+            st.session_state.vis_gen_history = []
+            st.session_state.vis_gen_text = prompt_input
+            st.rerun()
 
-            st.markdown(
-                "**Architecture:** token embedding + positional embedding → multi-head self-attention → residual/normalization → "
-                "feed-forward neural network → output layer → softmax probabilities."
-            )
+        trace = transparent_next_token(prompt_input, temperature)
+        stage = st.session_state.vis_gen_stage
+        stage_names = [
+            "1. Tokenize", "2. Embeddings", "3. Query–Key–Value",
+            "4. Attention", "5. Context vector", "6. Logits → Softmax", "7. Choose next token"
+        ]
+        st.progress((stage + 1) / 7)
+        st.markdown(f"### {stage_names[stage]}")
 
-            st.latex(r"\text{Forward pass: } x \rightarrow Embedding \rightarrow Attention \rightarrow FFN \rightarrow logits \rightarrow softmax")
-            st.latex(r"L=-\log P(\text{true next token})")
-            st.latex(r"W_{new}=W_{old}-\eta\frac{\partial L}{\partial W}")
+        if stage >= 0:
+            st.write("**Tokens entering the model**")
+            st.code("  →  ".join(trace['tokens']))
+            if stage == 0:
+                st.caption("A real tokenizer may split words into subword tokens. Here we keep the tokenization simple so the class can follow the calculations.")
 
-            if st.button("Train model from random weights", key="train_tiny_button"):
-                try:
-                    with st.spinner("Training the tiny Transformer locally..."):
-                        trained = train_tiny_transformer(epochs=epochs, learning_rate=lr, seed=seed)
-                    st.session_state["tiny_trained_bundle"] = trained
-                    log_event("Generative AI", "tiny_transformer_trained", {"epochs": epochs, "lr": lr})
-                except Exception as e:
-                    st.error(f"Training failed: {e}")
+        if stage >= 1:
+            emb_df = pd.DataFrame(trace['E'], index=trace['tokens'], columns=[f"e{i+1}" for i in range(_TOY_D)])
+            st.write("**Small embedding vectors (embedding + position information)**")
+            st.dataframe(emb_df.round(3), use_container_width=True)
+            st.latex(r"x_i = \text{Embedding}(token_i) + \text{Position}(i)")
+            if stage == 1:
+                st.caption("Words cannot enter a neural network as text. Each token is represented by a vector of numbers. Production LLMs use much larger learned vectors.")
 
-            trained = st.session_state.get("tiny_trained_bundle")
-            if trained:
-                hist = trained["history"]
-                grads = trained["gradient_history"]
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Initial cross-entropy loss", f"{hist[0]:.4f}")
-                m2.metric("Final cross-entropy loss", f"{hist[-1]:.4f}")
-                m3.metric("Loss reduction", f"{hist[0]-hist[-1]:.4f}")
+        if stage >= 2:
+            focus = trace['tokens'][-1]
+            st.write(f"**For the current/final token `{focus}`, form Query; all tokens provide Keys and Values.**")
+            q_df = pd.DataFrame([trace['Q'][-1]], index=[f"Query({focus})"], columns=[f"q{i+1}" for i in range(_TOY_D)])
+            st.dataframe(q_df.round(3), use_container_width=True)
+            with st.expander("See Key and Value vectors for every token"):
+                st.write("Keys")
+                st.dataframe(pd.DataFrame(trace['K'], index=trace['tokens'], columns=[f"k{i+1}" for i in range(_TOY_D)]).round(3), use_container_width=True)
+                st.write("Values")
+                st.dataframe(pd.DataFrame(trace['V'], index=trace['tokens'], columns=[f"v{i+1}" for i in range(_TOY_D)]).round(3), use_container_width=True)
+            st.latex(r"Q=XW_Q,\qquad K=XW_K,\qquad V=XW_V")
 
-                loss_df = pd.DataFrame({
-                    "Epoch": np.arange(1, len(hist)+1),
-                    "Cross-entropy loss": hist,
-                    "Output-layer gradient norm": grads,
-                })
-                fig, ax = plt.subplots(figsize=(8, 4.5))
-                ax.plot(loss_df["Epoch"], loss_df["Cross-entropy loss"])
-                ax.set_xlabel("Epoch")
-                ax.set_ylabel("Cross-entropy loss")
-                ax.set_title("Training objective being minimized")
-                st.pyplot(fig)
+        if stage >= 3:
+            att = pd.DataFrame({
+                "Token": trace['tokens'],
+                "Raw attention score": trace['scores'],
+                "Attention weight": trace['weights']
+            }).sort_values("Attention weight", ascending=False)
+            st.write("**Which earlier tokens matter most to the current token?**")
+            st.dataframe(att.round(4), use_container_width=True, hide_index=True)
+            st.bar_chart(att.set_index("Token")[["Attention weight"]])
+            st.latex(r"score_i=\frac{q\cdot k_i}{\sqrt{d}},\qquad attention=softmax(scores)")
+            if stage == 3:
+                st.caption("The dot product asks how well the current Query matches each Key. Softmax turns the scores into weights that sum to 1.")
 
-                st.markdown("### Feed-forward pass on one training example")
-                sample_index = st.slider(
-                    "Training example", 0, int(len(trained["X"])-1), 0, 1,
-                    key="tiny_sample_index"
-                )
-                details = tiny_forward_pass_details(trained, sample_index)
-                st.write("**Input context:**", " ".join(details["tokens"]))
-                st.write("**True next token:**", details["target_token"])
-                st.metric("Loss for this example after training", f"{details['loss']:.4f}")
-                st.dataframe(details["probabilities"], use_container_width=True, hide_index=True)
+        if stage >= 4:
+            st.write("**Combine the Value vectors using the attention weights**")
+            ctx_df = pd.DataFrame([trace['context']], index=["Contextual representation"], columns=[f"c{i+1}" for i in range(_TOY_D)])
+            st.dataframe(ctx_df.round(4), use_container_width=True)
+            st.latex(r"context=\sum_i attention_i\,V_i")
+            if stage == 4:
+                st.caption("This new vector represents the current token after it has incorporated information from the relevant context.")
 
-                st.markdown("### Attention matrix from the feed-forward pass")
-                st.dataframe(details["attention_matrix"], use_container_width=True)
+        if stage >= 5:
+            order = trace['order'][:10]
+            prob_df = pd.DataFrame({
+                "Candidate next token": [trace['vocab'][i] for i in order],
+                "Logit": [trace['logits'][i] for i in order],
+                "Probability": [trace['probs'][i] for i in order]
+            })
+            st.write("**Unembedding / output layer: score every candidate token**")
+            st.dataframe(prob_df.round(4), use_container_width=True, hide_index=True)
+            st.bar_chart(prob_df.set_index("Candidate next token")[["Probability"]])
+            st.latex(r"P(token_j)=softmax(logit_j/T)")
+            if stage == 5:
+                st.caption("Logits are raw output scores. Softmax converts them to probabilities. Temperature T changes how concentrated those probabilities are.")
 
-                st.markdown("### Backpropagation changed the weights")
-                # Show a compact slice of the output layer before and after training.
-                labels = [trained["itos"][i] for i in range(min(6, len(trained["itos"])))]
-                before = trained["initial_output"][:len(labels), :5]
-                after = trained["final_output"][:len(labels), :5]
+        if stage >= 6:
+            top_idx = int(trace['order'][0])
+            chosen = trace['vocab'][top_idx]
+            top_p = float(trace['probs'][top_idx])
+            st.success(f"Chosen next token (highest probability): **{chosen}** — probability {top_p:.1%}")
+            st.markdown(f"**Updated text:**  `{prompt_input} {chosen}`")
+            st.markdown("Now the added token becomes part of the input, and **the entire process runs again** for the following token.")
+
+            c1, c2 = st.columns(2)
+            if c1.button("Append chosen token and repeat", key="append_repeat"):
+                new_text = (prompt_input.rstrip() + " " + chosen).strip()
+                st.session_state.vis_gen_text = new_text
+                st.session_state.visual_gen_prompt = new_text
+                st.session_state.vis_gen_history.append((chosen, top_p))
+                st.session_state.vis_gen_stage = 0
+                st.rerun()
+            if c2.button("Generate 8 tokens automatically", key="auto_8"):
+                text_now = prompt_input.strip()
                 rows = []
-                for i, token in enumerate(labels):
-                    rows.append({
-                        "Output token": token,
-                        "W1 before": before[i, 0], "W1 after": after[i, 0],
-                        "W2 before": before[i, 1], "W2 after": after[i, 1],
-                        "W3 before": before[i, 2], "W3 after": after[i, 2],
-                    })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                st.caption(
-                    "Backpropagation calculates gradients of the loss with respect to the model parameters. The optimizer then "
-                    "updates those parameters. Repeating this process reduces the loss and changes the next-token probabilities."
-                )
+                for step in range(8):
+                    tr = transparent_next_token(text_now, temperature)
+                    ii = int(tr['order'][0])
+                    tok = tr['vocab'][ii]
+                    p = float(tr['probs'][ii])
+                    rows.append({"Step":step+1,"Context":text_now,"Chosen token":tok,"Probability":p})
+                    text_now = text_now + " " + tok
+                st.session_state['auto_generation_rows'] = rows
+                st.session_state['auto_generation_text'] = text_now
 
-    # -------------------------------------------------------------
-    # TAB 3 — LIVE LLM API
-    # -------------------------------------------------------------
-    with tab_live:
-        st.subheader("Try the same idea with a real LLM")
+            if st.session_state.get('auto_generation_rows'):
+                st.write("**Repeated next-token generation**")
+                st.dataframe(pd.DataFrame(st.session_state['auto_generation_rows']), use_container_width=True, hide_index=True)
+                st.info(st.session_state['auto_generation_text'])
+
         st.warning(
-            "Use only a personal/test API key that you are permitted to use. Do not paste institutional secrets or confidential "
-            "customer data. The key is used for the current request only and is not written to this app's analytics database. "
-            "Provider billing and rate limits may apply."
+            "Teaching-model limitation: the vectors and output layer here are deliberately tiny. The point is to make the actual sequence of operations visible; "
+            "a production LLM repeats analogous operations through many layers, heads and vastly larger learned matrices."
         )
-        provider = st.selectbox("Provider", ["OpenAI", "Gemini"], key="genai_live_provider")
-        if provider == "OpenAI":
-            default_model = "gpt-4.1-mini"
-            st.caption("Uses OpenAI's Responses API. Replace the model name if your API account uses another supported model.")
-        else:
-            default_model = "gemini-2.5-flash"
-            st.caption("Uses Google's Gemini generateContent API.")
-        api_key = st.text_input(f"{provider} API key", type="password", key="genai_api_key_new")
-        model = st.text_input("Model", value=default_model, key="genai_model_new")
-        prompt = st.text_area(
-            "Prompt",
-            value="Explain in simple language why a bank should verify an LLM answer before using it for an internal policy decision.",
-            height=150,
-            key="genai_live_prompt_new",
+
+    # ================================================================
+    # TAB 2 — FORWARD PROP + BACKPROP
+    # ================================================================
+    with tab_train:
+        st.subheader("Watch a neural network learn one next-word relationship")
+        st.markdown(
+            "This deliberately tiny network isolates the learning mechanism. We give it an **input word**, specify the **correct next word**, "
+            "run a forward pass, calculate loss, propagate the error backward, and update the weights."
         )
-        temperature = st.slider("Temperature", 0.0, 1.5, 0.5, 0.1, key="genai_live_temp_new")
-        if st.button("Generate with live LLM", key="genai_live_button_new"):
+
+        nn_vocab = ["bank", "loan", "customer", "payment", "risk"]
+        cc1, cc2, cc3 = st.columns(3)
+        input_word = cc1.selectbox("Input word", nn_vocab, index=0, key="nn_input_word")
+        target_options = [w for w in nn_vocab if w != input_word]
+        target_word = cc2.selectbox("Correct next word (training target)", target_options, index=0, key="nn_target_word")
+        lr = cc3.slider("Learning rate η", 0.01, 1.0, 0.20, 0.01, key="nn_lr")
+
+        pair_key = f"{input_word}->{target_word}"
+        if st.session_state.get('nn_pair_key') != pair_key or 'tiny_nn_state' not in st.session_state:
+            st.session_state.tiny_nn_state = _nn_initial_state(len(nn_vocab), hidden=3)
+            st.session_state.nn_pair_key = pair_key
+            st.session_state.nn_phase = 0
+
+        state = st.session_state.tiny_nn_state
+        input_idx = nn_vocab.index(input_word)
+        target_idx = nn_vocab.index(target_word)
+        cache = _nn_forward(state, input_idx, target_idx)
+
+        phase_names = [
+            "1. Encode input", "2. Hidden weighted sum z¹", "3. Activation a¹",
+            "4. Output logits z²", "5. Softmax prediction", "6. Loss",
+            "7. Backpropagate gradients", "8. Update weights"
+        ]
+        b1,b2,b3 = st.columns(3)
+        if b1.button("← Previous", key="nn_prev"):
+            st.session_state.nn_phase = max(0, st.session_state.nn_phase-1)
+        if b2.button("Next →", key="nn_next"):
+            st.session_state.nn_phase = min(7, st.session_state.nn_phase+1)
+        if b3.button("Reset weights", key="nn_reset"):
+            st.session_state.tiny_nn_state = _nn_initial_state(len(nn_vocab), hidden=3)
+            st.session_state.nn_phase = 0
+            st.rerun()
+
+        phase = st.session_state.nn_phase
+        st.progress((phase+1)/8)
+        st.markdown(f"### {phase_names[phase]}")
+
+        if phase >= 0:
+            st.write("**One-hot input vector**")
+            st.dataframe(pd.DataFrame([cache['x']], columns=nn_vocab, index=[input_word]), use_container_width=True)
+            st.caption("Only the position corresponding to the input word is 1; the others are 0.")
+
+        if phase >= 1:
+            st.latex(r"z^{(1)} = xW^{(1)} + b^{(1)}")
+            st.dataframe(pd.DataFrame([cache['z1']], columns=["h1","h2","h3"], index=["z¹"]).round(4), use_container_width=True)
+            with st.expander("See current input→hidden weights W¹"):
+                st.dataframe(pd.DataFrame(state['W1'], index=nn_vocab, columns=["h1","h2","h3"]).round(4), use_container_width=True)
+
+        if phase >= 2:
+            st.latex(r"a^{(1)}=tanh(z^{(1)})")
+            st.dataframe(pd.DataFrame([cache['a1']], columns=["h1","h2","h3"], index=["hidden activation"]).round(4), use_container_width=True)
+            st.caption("We use tanh only to make the non-linearity easy to inspect. Other networks may use ReLU, GELU, sigmoid, etc.")
+
+        if phase >= 3:
+            st.latex(r"z^{(2)}=a^{(1)}W^{(2)}+b^{(2)}")
+            st.dataframe(pd.DataFrame([cache['z2']], columns=nn_vocab, index=["output logits"]).round(4), use_container_width=True)
+            with st.expander("See current hidden→output weights W²"):
+                st.dataframe(pd.DataFrame(state['W2'], index=["h1","h2","h3"], columns=nn_vocab).round(4), use_container_width=True)
+
+        if phase >= 4:
+            st.latex(r"\hat{y}=softmax(z^{(2)})")
+            pred_df = pd.DataFrame({"Word":nn_vocab,"Predicted probability":cache['probs']}).sort_values("Predicted probability",ascending=False)
+            st.dataframe(pred_df.round(4), use_container_width=True, hide_index=True)
+            st.bar_chart(pred_df.set_index("Word"))
+            predicted = nn_vocab[int(np.argmax(cache['probs']))]
+            st.write(f"Current prediction: **{predicted}**")
+
+        if phase >= 5:
+            st.latex(r"L=-\log P(\text{correct word})")
+            st.metric("Cross-entropy loss", f"{cache['loss']:.4f}")
+            st.write(f"Correct target is **{target_word}**; its current probability is **{cache['probs'][target_idx]:.2%}**.")
+            st.caption("If the correct word receives low probability, the loss is high. Training tries to minimize this loss.")
+
+        preview_new, grads = _nn_backprop(state, cache, lr)
+        if phase >= 6:
+            st.markdown("**Error now moves backward from the output toward the earlier weights.**")
+            st.latex(r"\frac{\partial L}{\partial z^{(2)}}=\hat{y}-y")
+            st.latex(r"\frac{\partial L}{\partial W^{(2)}}=a^{(1)T}\frac{\partial L}{\partial z^{(2)}}")
+            st.latex(r"\frac{\partial L}{\partial z^{(1)}}=\left(W^{(2)}\frac{\partial L}{\partial z^{(2)}}\right)\odot(1-a^{(1)2})")
+            gcols = st.columns(2)
+            gcols[0].write("Gradient for W¹")
+            gcols[0].dataframe(pd.DataFrame(grads['dW1'], index=nn_vocab, columns=["h1","h2","h3"]).round(4), use_container_width=True)
+            gcols[1].write("Gradient for W²")
+            gcols[1].dataframe(pd.DataFrame(grads['dW2'], index=["h1","h2","h3"], columns=nn_vocab).round(4), use_container_width=True)
+
+        if phase >= 7:
+            st.latex(r"W_{new}=W_{old}-\eta\frac{\partial L}{\partial W}")
+            after = _nn_forward(preview_new, input_idx, target_idx)
+            m1,m2,m3 = st.columns(3)
+            m1.metric("Loss before", f"{cache['loss']:.4f}")
+            m2.metric("Loss after one update", f"{after['loss']:.4f}", delta=f"{after['loss']-cache['loss']:+.4f}")
+            m3.metric(f"P({target_word}) after", f"{after['probs'][target_idx]:.2%}")
+            st.write("**Example of weights changing**")
+            change_df = pd.DataFrame({
+                "Old input→hidden weights": state['W1'][input_idx],
+                "Gradient": grads['dW1'][input_idx],
+                "Updated weights": preview_new['W1'][input_idx]
+            }, index=["h1","h2","h3"])
+            st.dataframe(change_df.round(5), use_container_width=True)
+            if st.button("Apply this weight update", key="apply_nn_update"):
+                preview_new['loss_history'].append(cache['loss'])
+                st.session_state.tiny_nn_state = preview_new
+                st.session_state.nn_phase = 1
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("### Train repeatedly and watch the cost fall")
+        steps = st.slider("Training updates", 1, 100, 30, 1, key="nn_many_steps")
+        if st.button("Run repeated forward + backprop updates", key="nn_train_many"):
+            s2 = state
+            losses=[]
+            for _ in range(steps):
+                c = _nn_forward(s2, input_idx, target_idx)
+                losses.append(c['loss'])
+                s2, _ = _nn_backprop(s2, c, lr)
+            s2['loss_history'] = list(state.get('loss_history', [])) + losses
+            st.session_state.tiny_nn_state = s2
+            st.session_state['nn_last_run_losses'] = losses
+            st.rerun()
+
+        hist = state.get('loss_history', [])
+        if hist:
+            st.line_chart(pd.DataFrame({"Loss":hist}, index=np.arange(1,len(hist)+1)))
+            final_cache = _nn_forward(state, input_idx, target_idx)
+            st.success(
+                f"After training: loss = {final_cache['loss']:.4f}; "
+                f"P({target_word}) = {final_cache['probs'][target_idx]:.2%}."
+            )
+            st.write("**Final optimized weights W¹**")
+            st.dataframe(pd.DataFrame(state['W1'], index=nn_vocab, columns=["h1","h2","h3"]).round(4), use_container_width=True)
+            st.write("**Final optimized weights W²**")
+            st.dataframe(pd.DataFrame(state['W2'], index=["h1","h2","h3"], columns=nn_vocab).round(4), use_container_width=True)
+
+        st.info(
+            "Connection to LLM training: the arithmetic is the same idea — forward pass, loss, gradients, weight update — but real Transformers contain "
+            "many layers and enormous parameter matrices and are trained over huge numbers of token-prediction examples."
+        )
+
+    # ================================================================
+    # TAB 3 — LIVE API
+    # ================================================================
+    with tab_api:
+        st.subheader("Compare the transparent model with a real LLM")
+        st.warning(
+            "Use only a personal/test API key you are permitted to use. Do not enter confidential customer or institutional information. "
+            "The key is used for this request and is not written to the teaching analytics database."
+        )
+        provider = st.selectbox("Provider", ["OpenAI", "Gemini"], key="live_provider_v2")
+        default_model = "gpt-4.1-mini" if provider == "OpenAI" else "gemini-2.5-flash"
+        api_key = st.text_input(f"{provider} API key", type="password", key="live_key_v2")
+        model = st.text_input("Model", value=default_model, key="live_model_v2")
+        prompt = st.text_area("Prompt", value="Explain credit risk to a new banking customer in simple language.", height=120, key="live_prompt_v2")
+        temp_live = st.slider("Temperature", 0.0, 1.5, 0.5, 0.1, key="live_temp_v2")
+        if st.button("Generate with real LLM", key="live_go_v2"):
             if not api_key:
                 st.error("Enter an API key first.")
             else:
                 try:
-                    with st.spinner("Calling the selected provider..."):
-                        answer, raw = call_live_llm(provider, api_key, model, prompt, temperature)
-                    if answer:
-                        st.success("Live model response")
-                        st.write(answer)
-                        st.caption(
-                            "A commercial API exposes the generated response, but not every internal embedding, attention head, "
-                            "gradient or learned weight used inside the full model."
-                        )
-                        log_event("Generative AI", "live_llm_used", {"provider": provider, "model": model})
-                    else:
-                        st.error("The provider returned no displayable text.")
-                except urllib.error.HTTPError as e:
-                    try:
-                        detail = e.read().decode("utf-8")[:1200]
-                    except Exception:
-                        detail = str(e)
-                    st.error(f"Provider returned HTTP {e.code}. {detail}")
+                    with st.spinner("Calling provider..."):
+                        answer, _ = call_live_llm(provider, api_key, model, prompt, temp_live)
+                    st.success("Model response")
+                    st.write(answer)
+                    st.caption("A hosted API normally does not expose all internal embeddings, attention heads, gradients or weights. The first two tabs are designed to make those ideas visible locally.")
                 except Exception as e:
                     st.error(f"Live generation failed: {e}")
 
-    # -------------------------------------------------------------
-    # TAB 4 — ASK A FILE / RAG
-    # -------------------------------------------------------------
+    # ================================================================
+    # TAB 4 — FILE / RAG
+    # ================================================================
     with tab_file:
-        st.subheader("Upload a document and retrieve relevant context")
+        st.subheader("Ask a file — see retrieval before generation")
         st.markdown(
-            "This demonstrates the retrieval part of RAG. The file is converted to text, divided into passages, and the passages "
-            "most similar to the question are retrieved. You can inspect retrieval locally without any API, or optionally send the "
-            "retrieved context to an LLM for a grounded answer."
+            "Upload a small document and ask a question. The app first finds the most relevant passages. "
+            "You can inspect those passages **before** optionally sending them to a real LLM."
         )
-        uploaded = st.file_uploader(
-            "Upload TXT, CSV, PDF or DOCX",
-            type=["txt", "csv", "pdf", "docx"],
-            key="genai_file_upload",
-        )
-        if uploaded is not None:
+        uploaded_doc = st.file_uploader("Upload TXT, CSV, PDF or DOCX", type=["txt","csv","pdf","docx"], key="rag_file_v2")
+        if uploaded_doc is not None:
             try:
-                document_text = extract_uploaded_document(uploaded)
-                st.success(f"Extracted {len(document_text):,} characters from {uploaded.name}.")
+                doc_text = extract_genai_file(uploaded_doc)
+                st.success(f"Extracted {len(doc_text):,} characters from {uploaded_doc.name}")
                 with st.expander("Preview extracted text"):
-                    st.text(document_text[:6000])
-
-                query = st.text_input(
-                    "Ask a question about the document",
-                    value="What are the main points in this document?",
-                    key="genai_file_question",
-                )
-                top_k = st.slider("Passages to retrieve", 1, 5, 3, 1, key="genai_file_topk")
-                if st.button("Retrieve passages", key="genai_file_retrieve"):
-                    st.session_state["genai_file_retrieved"] = rag_retrieve(query, document_text, top_k=top_k)
-
-                retrieved = st.session_state.get("genai_file_retrieved", [])
-                if retrieved:
-                    st.markdown("### Retrieved passages")
-                    for i, (chunk, score) in enumerate(retrieved, 1):
+                    st.text(doc_text[:5000])
+                q = st.text_input("Question about the file", value="What are the main rules or requirements?", key="rag_q_v2")
+                top_k = st.slider("Passages to retrieve", 1, 5, 3, key="rag_k_v2")
+                if st.button("Retrieve relevant passages", key="rag_retrieve_v2"):
+                    st.session_state['rag_file_hits_v2'] = rag_retrieve(q, doc_text, top_k=top_k)
+                hits = st.session_state.get('rag_file_hits_v2', [])
+                if hits:
+                    st.write("### Retrieved evidence")
+                    for i,(chunk,score) in enumerate(hits,1):
                         st.markdown(f"**Passage {i} — similarity {score:.3f}**")
                         st.write(chunk)
+                    st.caption("This retrieval step is local. It shows which text would be supplied as context to the generator.")
 
-                    st.markdown("### Optional grounded generation")
-                    use_api = st.checkbox("Use an API to generate an answer from only the retrieved context", key="genai_file_use_api")
-                    if use_api:
-                        provider2 = st.selectbox("Provider", ["OpenAI", "Gemini"], key="file_provider")
-                        default2 = "gpt-4.1-mini" if provider2 == "OpenAI" else "gemini-2.5-flash"
-                        key2 = st.text_input(f"{provider2} API key", type="password", key="file_api_key")
-                        model2 = st.text_input("Model", value=default2, key="file_model")
-                        context_text = "\n\n".join(chunk for chunk, _ in retrieved)
-                        grounded_prompt = (
-                            "Answer the user's question using only the retrieved context below. "
-                            "If the answer is not supported by the context, say that the document does not provide enough information.\n\n"
-                            f"QUESTION:\n{query}\n\nRETRIEVED CONTEXT:\n{context_text}"
-                        )
-                        if st.button("Generate grounded answer", key="file_generate_grounded"):
-                            if not key2:
+                    use_llm = st.checkbox("Generate a grounded answer with an API", value=False, key="rag_api_toggle_v2")
+                    if use_llm:
+                        provider_rag = st.selectbox("Provider", ["OpenAI","Gemini"], key="rag_provider_v2")
+                        api_rag = st.text_input("API key", type="password", key="rag_key_v2")
+                        model_rag = st.text_input("Model", value=("gpt-4.1-mini" if provider_rag=="OpenAI" else "gemini-2.5-flash"), key="rag_model_v2")
+                        if st.button("Generate grounded answer", key="rag_answer_v2"):
+                            if not api_rag:
                                 st.error("Enter an API key first.")
                             else:
+                                context = "\n\n".join(chunk for chunk,_ in hits)
+                                grounded_prompt = (
+                                    "Answer only from the supplied context. If the context is insufficient, say so.\n\n"
+                                    f"CONTEXT:\n{context}\n\nQUESTION:\n{q}"
+                                )
                                 try:
-                                    with st.spinner("Generating from retrieved context..."):
-                                        answer2, _ = call_live_llm(provider2, key2, model2, grounded_prompt, 0.2)
+                                    ans,_ = call_live_llm(provider_rag, api_rag, model_rag, grounded_prompt, 0.2)
                                     st.success("Grounded answer")
-                                    st.write(answer2)
-                                    log_event("Generative AI", "document_rag_used", {"provider": provider2, "file": uploaded.name})
+                                    st.write(ans)
                                 except Exception as e:
-                                    st.error(f"Grounded generation failed: {e}")
-                    else:
-                        st.info(
-                            "No API is needed to demonstrate retrieval. The passages above are the evidence that would normally be "
-                            "supplied to an LLM in a RAG workflow."
-                        )
+                                    st.error(f"Generation failed: {e}")
             except Exception as e:
-                st.error(f"Could not read the uploaded file: {e}")
-
+                st.error(str(e))
 
 # ---------------------------------------------------------------------
 # FEEDBACK
